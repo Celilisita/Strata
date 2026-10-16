@@ -9,8 +9,8 @@ static __device__ __forceinline__ void strata_q4_code_sum_dot(
     const int* __restrict__ x, const int* __restrict__ y,
     float* __restrict__ sum, const int k00) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
-    constexpr int nwarps = ggml_cuda_mmq_get_nthreads(GGML_TYPE_Q4_K, J, fallback) / warp_size;
-    constexpr int I = ggml_cuda_mmq_get_I(GGML_TYPE_Q4_K, J, fallback);
+    constexpr int nwarps = ggml_cuda_mmq_get_nthreads(GGML_TYPE_Q4_K, J, fallback STRATA_NATIVE_MMQ_Q8) / warp_size;
+    constexpr int I = ggml_cuda_mmq_get_I(GGML_TYPE_Q4_K, J, fallback STRATA_NATIVE_MMQ_Q8);
     constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_Q4_K, I);
     const int* x_qs = x;
     const half2* x_dm = reinterpret_cast<const half2*>(x_qs) + txs.qs;
@@ -47,7 +47,7 @@ static __device__ __forceinline__ void strata_q4_code_sum_dot(
 
 #define STRATA_CODE_SUM_DOT(J, F) \
     template<> __device__ constexpr ggml_cuda_mmq_vec_dot_t \
-    strata_code_sum_get_vec_dot<GGML_TYPE_Q4_K, J, F>() { return strata_q4_code_sum_dot<J, F>; }
+    strata_code_sum_get_vec_dot<GGML_TYPE_Q4_K, J, F STRATA_NATIVE_MMQ_Q8>() { return strata_q4_code_sum_dot<J, F>; }
 #define STRATA_CODE_SUM_J(J) STRATA_CODE_SUM_DOT(J, false) STRATA_CODE_SUM_DOT(J, true)
 STRATA_CODE_SUM_J(8) STRATA_CODE_SUM_J(16) STRATA_CODE_SUM_J(24) STRATA_CODE_SUM_J(32)
 STRATA_CODE_SUM_J(40) STRATA_CODE_SUM_J(48) STRATA_CODE_SUM_J(56) STRATA_CODE_SUM_J(64)

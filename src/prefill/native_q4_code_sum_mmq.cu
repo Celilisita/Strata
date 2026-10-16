@@ -12,7 +12,8 @@
 #define launch_mul_mat_q strata_code_sum_launch
 #define mul_mat_q_switch_J strata_code_sum_switch_J
 #define mul_mat_q_case strata_code_sum_case
-#include "mmq.cuh"
+#include "native_code_sum_backend.cuh"
+#include "native_mmq_precision.cuh"
 #undef ggml_cuda_mmq_get_vec_dot
 #undef mul_mat_q_process_tile
 #undef mul_mat_q
@@ -93,8 +94,8 @@ void Context::run_code_sum(const Product& p, void* stream) {
     a.stride_channel_x = int64_t(p.expert_bytes / ggml_type_size(GGML_TYPE_Q4_K));
     a.ncols_max = p.max_rows;
     auto& ctx = *static_cast<ggml_backend_cuda_context*>(ctx_);
-    if (p.w_rows % 128) strata_code_sum_switch_J<GGML_TYPE_Q4_K, true>(ctx, a, static_cast<cudaStream_t>(stream));
-    else strata_code_sum_switch_J<GGML_TYPE_Q4_K, false>(ctx, a, static_cast<cudaStream_t>(stream));
+    if (p.w_rows % 128) strata_code_sum_switch_J<GGML_TYPE_Q4_K, true STRATA_NATIVE_MMQ_Q8>(ctx, a, static_cast<cudaStream_t>(stream));
+    else strata_code_sum_switch_J<GGML_TYPE_Q4_K, false STRATA_NATIVE_MMQ_Q8>(ctx, a, static_cast<cudaStream_t>(stream));
     CUDA_CHECK(cudaGetLastError());
 }
 } // namespace strata::prefill::mmq

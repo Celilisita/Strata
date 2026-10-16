@@ -3,14 +3,14 @@
 namespace strata::prefill::mmq {
 namespace {
 template<ggml_type Type, int J, bool Active>
-__launch_bounds__(ggml_cuda_mmq_get_nthreads(Type, J, false),
-    ggml_cuda_mmq_get_occupancy(Type, J, false))
+__launch_bounds__(ggml_cuda_mmq_get_nthreads(Type, J, false STRATA_NATIVE_MMQ_Q8),
+    ggml_cuda_mmq_get_occupancy(Type, J, false STRATA_NATIVE_MMQ_Q8))
 __global__ void native_grouped_mmq_tile(const NativeMmqMatrix* matrices,
     const int32_t* output_ids, const int* packed, float* output,
     int rows, int cols, int outputs, const NativeMmqTile* tiles) {
     constexpr auto type = Type;
-    constexpr int I = ggml_cuda_mmq_get_I(type, J, false);
-    constexpr int warps = ggml_cuda_mmq_get_nthreads(type, J, false) / 32;
+    constexpr int I = ggml_cuda_mmq_get_I(type, J, false STRATA_NATIVE_MMQ_Q8);
+    constexpr int warps = ggml_cuda_mmq_get_nthreads(type, J, false STRATA_NATIVE_MMQ_Q8) / 32;
     const auto tile = Active ? tiles[blockIdx.y] : NativeMmqTile{int(blockIdx.z), int(blockIdx.y)};
     const auto m = matrices[tile.matrix];
     const int count = m.end - m.begin, jt = tile.tile;
@@ -24,7 +24,7 @@ __global__ void native_grouped_mmq_tile(const NativeMmqMatrix* matrices,
     }
     __syncthreads();
     constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
-    strata_code_sum_process_tile<type, J, false, false>(
+    strata_code_sum_process_tile<type, J, false, false STRATA_NATIVE_MMQ_Q8>(
         reinterpret_cast<const char*>(uintptr_t(part ? m.up : m.gate)),
         out_first * (cols / 256), packed + (m.begin + jt * J) * sz, ids,
         output + size_t(part) * rows * outputs + out_first, nullptr, nullptr,
@@ -46,7 +46,7 @@ void launch_native_grouped_mmq(const NativeMmqMatrix* matrices, int groups, int 
     if (ggml_cuda_highest_compiled_arch(cc) != GGML_CUDA_CC_VOLTA)
         throw std::runtime_error("grouped exact-code-sum MMQ requires measured Volta DP4A");
     constexpr int J = 64;
-    const auto config = ggml_cuda_mmq_get_config(Type, J, false, cc);
+    const auto config = ggml_cuda_mmq_get_config(Type, J, false, cc STRATA_NATIVE_MMQ_Q8);
     const int shared = int(mmq_get_nbytes_shared(config, cc));
     if (tiles) {
         CUDA_SET_SHARED_MEMORY_LIMIT((native_grouped_mmq_tile<Type, J, true>), shared);
