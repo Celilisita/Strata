@@ -3,7 +3,7 @@
 #include <limits>
 #include <stdexcept>
 namespace strata::prefill::mmq {
-inline void select_native_mmq_tile(mmq_args& args, int64_t columns) {
+static inline void select_native_mmq_tile(mmq_args& args, int64_t columns) {
 #ifdef STRATA_DEEPSEEK_V4_GGML_API
     const auto& dev = ggml_cuda_info().devices[ggml_cuda_get_device()];
     const bool fallback = ggml_cuda_mmq_needs_fallback(args.nrows_x);
