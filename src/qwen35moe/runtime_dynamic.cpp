@@ -60,9 +60,10 @@ void Runtime::start_decode(Metrics* metrics) {
     frame.cache_tick = expert_cache_.tick;
     std::vector<core::NativeMissArgs> args(expert_sources_.size());
     int device = -1;
-    cudaDeviceProp properties{};
+    int clock_khz = 0;
     cuda_check(cudaGetDevice(&device), "decode device");
-    cuda_check(cudaGetDeviceProperties(&properties, device), "decode clock");
+    cuda_check(cudaDeviceGetAttribute(&clock_khz, cudaDevAttrClockRate, device), "decode clock");
+    if (clock_khz <= 0) throw std::runtime_error("invalid decode clock rate");
     unsigned timeout_ms = 50;
     if (const char* raw = std::getenv("STRATA_QWEN35_MISS_TIMEOUT_MS")) {
         const std::string value(raw);
@@ -88,7 +89,7 @@ void Runtime::start_decode(Metrics* metrics) {
         a.gu_rows = batch_.expert_rows.as<int32_t>();
         a.down_rows = batch_.down_rows.as<int32_t>();
         a.layer = int(il); a.n_expert = int(spec_.n_expert);
-        a.timeout_cycles = uint64_t(properties.clockRate) * timeout_ms; // kHz * ms
+        a.timeout_cycles = uint64_t(clock_khz) * timeout_ms; // kHz * ms
     }
     std::vector<core::NativeMissArgs> pair_args;
     if (dynamic_pair_args_.bytes()) {
