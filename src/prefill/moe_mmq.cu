@@ -6,6 +6,7 @@
 
 #include "common.cuh"
 #include "mmq.cuh"
+#include "native_mmq_tile_choice.cuh"
 #include "quantize.cuh"
 
 #include <cstdio>
@@ -212,7 +213,7 @@ void Context::run(const Product& p, void* stream) {
                         p.n, p.n, (int64_t) (p.expert_bytes / ggml_type_size(t)), 0, 0,
                         1, 1, 0, 0, 0,
                         p.max_rows};
-    set_tile_hint(a, p.max_rows, 0);
+    select_native_mmq_tile(a, p.max_rows);
     auto& ctx = *(ggml_backend_cuda_context*) ctx_;
     const cudaStream_t s = (cudaStream_t) stream;
     switch (t) {
