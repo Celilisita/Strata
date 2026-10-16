@@ -1,0 +1,5 @@
+启动 BAT、router 和运行配置：G:\Strata_lanuch
+公共引擎：F:\Codex\Strata_moe\build\sm70\Release\strata.exe
+Python 服务：本工程 serve/ 与 tools/。
+原工程备份：F:\Codex\Strata_moe_bak。
+历史构建缓存仍保留在 G:\temp\strata-mainline-integration-20261015\build，本次未重新配置或编译。

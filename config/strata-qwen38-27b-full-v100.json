@@ -1,0 +1,105 @@
+{
+  "family": "qwen35_dense",
+  "variant": "qwen38_27b",
+  "model_name": "qwen38-27b-strata-full-history",
+  "model": "G:\\LM_Models\\JonathanColetti\\Qwen3.8-27B-Uncensored-GGUF\\Qwen3.8-27B-Uncensored-Q4_K_M.gguf",
+  "exe": "F:\\Codex\\Strata_moe\\build\\sm70\\Release\\strata.exe",
+  "tokenizer": "F:\\Codex\\Strata_moe\\config\\frontends\\qwen38-27b\\tokenizer",
+  "cwd": "G:\\temp\\strata-mainline-integration-20261015",
+  "temp_dir": "G:\\temp\\strata-mainline-integration-20261015\\temp",
+  "args": [],
+  "gpu_uuid": "GPU-4d8d8556-98bb-c0e3-cb5f-dd3d5359defb",
+  "context": 262144,
+  "slots": 1,
+  "dspark": false,
+  "mtp": 2,
+  "kv_policy": "full",
+  "env": {
+    "STRATA_DENSE_RESERVE_MIB": "4096",
+    "CUDA_VISIBLE_DEVICES": "GPU-4d8d8556-98bb-c0e3-cb5f-dd3d5359defb",
+    "CUDA_DEVICE_ORDER": "PCI_BUS_ID"
+  },
+  "sampling": {
+    "temperature": 0,
+    "top_k": 20,
+    "top_p": 0.95,
+    "min_p": 0
+  },
+  "capabilities": {
+    "sampling": [
+      "greedy",
+      "temperature",
+      "top_k",
+      "top_p",
+      "min_p",
+      "penalties"
+    ],
+    "max_slots": 1,
+    "speculation": "native-mtp",
+    "speculation_sampling": "greedy-only; sampled requests use ordinary decode",
+    "prefix_resume": false,
+    "images": false
+  },
+  "asset_binding": {
+    "path": "G:\\LM_Models\\JonathanColetti\\Qwen3.8-27B-Uncensored-GGUF\\Qwen3.8-27B-Uncensored-Q4_K_M.gguf",
+    "bytes": 16810714528,
+    "mtime_ns": 1786812291364302100,
+    "frontend": {
+      "chat_template.jinja": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041",
+      "merges.txt": "080cf95432173729d160346b7882bd2a644b07f7a3813a3eb73f4e66787bfde9",
+      "tokenizer.json": "87be2ac47d8bc7393b7435df6ccd276740019a393941a2585d5edce59f450c54",
+      "token_type.json": "5088c8c298fc06af8382ddb3b76c888703ac2634e82263b97eedcc2ad202738b",
+      "vocab.json": "4ba64f0332abcfb0b600b7df1537d1e836e68009d5fb7cdb77339738dc6365c4"
+    },
+    "metadata": {
+      "general.architecture": "qwen35",
+      "general.name": "Abl 27b",
+      "qwen35.block_count": 65,
+      "qwen35.context_length": 262144,
+      "qwen35.embedding_length": 5120,
+      "tokenizer.ggml.model": "gpt2",
+      "tokenizer.ggml.pre": "qwen35",
+      "general.file_type": 15
+    },
+    "tensor_contract": {
+      "tensor_count": 866,
+      "tensor_table_sha256": "e396b652ea9a5b4041c5eacefd7cd99128b6fdd76488c429c68db09584334592",
+      "quant_types": {
+        "Q6_K": 67,
+        "F32": 360,
+        "Q4_K": 439
+      },
+      "data_offset": 10995104,
+      "checked": "shapes, formats, alignment and file extents; tensor payload not read",
+      "stop_ids": [
+        248046
+      ]
+    }
+  },
+  "validation_status": "compiled; full-history alternative not run in this regression",
+  "gpu": 1,
+  "dll_dirs": [
+    "F:\\Codex\\Strata_moe\\build\\sm70\\Release",
+    "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.8\\bin"
+  ],
+  "context_policy": {
+    "kind": "full-history",
+    "ram_index_enabled": false,
+    "kv_type": "q8",
+    "full_ram_history": false,
+    "pp_full_history": true,
+    "resident_tokens": null,
+    "selected_tokens": null,
+    "keep_queries": 0,
+    "approximate_TG_selection": false
+  },
+  "speculation": {
+    "kind": "native-mtp",
+    "enabled": true,
+    "sampling": "greedy-only",
+    "sampled_fallback": "ordinary-decode"
+  },
+  "stop_token_ids": [
+    248046
+  ]
+}

@@ -1,0 +1,53 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "v100-native",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/build/sm70",
+      "cacheVariables": {
+        "STRATA_ENABLE_CUDA": "ON",
+        "STRATA_EXPERIMENTAL_SM60": "ON",
+        "CMAKE_CUDA_ARCHITECTURES": "70",
+        "CMAKE_CUDA_RUNTIME_LIBRARY": "Shared",
+        "STRATA_BUILD_TESTS": "OFF",
+        "STRATA_PRODUCTION_ONLY": "ON",
+        "STRATA_DEEPSEEK_V4": "OFF",
+        "STRATA_QWEN35_MOE": "ON",
+        "STRATA_QWEN35_DENSE": "ON",
+        "STRATA_MMQ_KQUANTS": "ON",
+        "STRATA_Q6K_EXPERTS": "ON",
+        "STRATA_GGML_DIR": "G:\\llama.cpp",
+        "STRATA_CUTLASS_DIR": "F:\\Codex\\strata-v100-qwen38-27b-20261006\\deps\\cutlass"
+      }
+    },
+    {
+      "name": "mainline-cuda",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/build/mainline-cuda",
+      "cacheVariables": {
+        "STRATA_ENABLE_CUDA": "ON",
+        "CMAKE_CUDA_ARCHITECTURES": "120",
+        "STRATA_BUILD_TESTS": "OFF",
+        "STRATA_PRODUCTION_ONLY": "ON",
+        "STRATA_DEEPSEEK_V4": "ON",
+        "STRATA_LLAMA_SOURCE_DIR": "$env{STRATA_D4_SOURCE}",
+        "STRATA_QWEN35_MOE": "OFF",
+        "STRATA_QWEN35_DENSE": "OFF"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "v100-native",
+      "configurePreset": "v100-native",
+      "configuration": "Release",
+      "targets": [
+        "strata"
+      ],
+      "jobs": 2
+    }
+  ]
+}

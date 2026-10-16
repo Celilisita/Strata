@@ -1,0 +1,159 @@
+{
+  "family": "qwen35_moe",
+  "variant": "minicpm_v47",
+  "model_name": "minicpm-v47-strata",
+  "model": "G:\\LM_Models\\openbmb\\MiniCPM-V-4.7-35B-A3B-gguf\\MiniCPM-V-4_7-35B-A3B-Q4_K_S.gguf",
+  "exe": "F:\\Codex\\Strata_moe\\build\\sm70\\Release\\strata.exe",
+  "tokenizer": "F:\\Codex\\Strata_moe\\config\\frontends\\minicpm-v47\\tokenizer",
+  "cwd": "G:\\temp\\strata-mainline-integration-20261015",
+  "temp_dir": "G:\\temp\\strata-mainline-integration-20261015\\temp",
+  "args": [],
+  "gpu_uuid": "GPU-4d8d8556-98bb-c0e3-cb5f-dd3d5359defb",
+  "context": 131072,
+  "slots": 2,
+  "dspark": false,
+  "mtp": 0,
+  "kv_policy": "on-demand",
+  "env": {
+    "STRATA_QWEN35_GPU_MEMORY_MIB": "12000",
+    "STRATA_QWEN35_MTP": "0",
+    "STRATA_QWEN35_INITIAL_CONTEXT": "8192",
+    "STRATA_QWEN35_BATCH_SIZE": "8192",
+    "STRATA_QWEN35_UBATCH_SIZE": "8192",
+    "STRATA_QWEN35_GPU_HEAD": "1",
+    "STRATA_QWEN35_TILE_ATTENTION": "1",
+    "STRATA_QWEN35_PREFILL_TC": "1",
+    "STRATA_QWEN35_PREFILL_SCAN": "1",
+    "STRATA_QWEN35_BATCH_ATTN": "1",
+    "STRATA_QWEN35_BULK_QUANT": "1",
+    "STRATA_QWEN35_BULK_ROUTE": "1",
+    "STRATA_QWEN35_TG_DYNAMIC": "1",
+    "STRATA_QWEN35_ROUTED_TC": "1",
+    "STRATA_QWEN35_GATHERED_GU": "1",
+    "STRATA_QWEN35_ATTN_QUERY_BATCH": "64",
+    "STRATA_QWEN35_ATTN_QUERY_GROUP": "2",
+    "STRATA_QWEN35_ATTN_SHARED_JOIN": "0",
+    "STRATA_QWEN35_ATTN_PAD_CACHE": "0",
+    "STRATA_QWEN35_BULK_PROJECTION": "1",
+    "STRATA_NATIVE_PROJECTION_BULK_TYPES": "8,14",
+    "STRATA_NATIVE_PROJECTION_ROWS": "1",
+    "STRATA_QWEN35_DENSE_TC": "0",
+    "STRATA_QWEN35_ATTN_TC": "1",
+    "STRATA_QWEN35_QKV_Q4_MMQ": "1",
+    "STRATA_QWEN35_QKV_MMQ": "1",
+    "STRATA_QWEN35_GDN_OUT_MMQ": "1",
+    "STRATA_QWEN35_GU_MMQ": "1",
+    "STRATA_QWEN35_DOWN_MMQ": "1",
+    "STRATA_QWEN35_MMQ_PROJECTION": "1",
+    "STRATA_QWEN35_ATTN_SHORT_BATCH": "1",
+    "STRATA_QWEN35_ATTN_SCRATCH_REUSE": "1",
+    "STRATA_QWEN35_ROUTER_TILED": "1",
+    "STRATA_QWEN35_MTP_KV_BULK": "1",
+    "STRATA_QWEN35_CACHE_RETENTION": "1",
+    "STRATA_QWEN35_RETENTION_PLAN": "1",
+    "STRATA_QWEN35_PP_BATCH_EMBEDDING": "1",
+    "STRATA_QWEN35_LONG_WORKSPACE": "reuse",
+    "STRATA_QWEN35_TG_DEVICE_GATHER": "0",
+    "STRATA_QWEN35_TG_DIAG": "0",
+    "STRATA_QWEN35_PREWARM_CACHE": "1",
+    "STRATA_QWEN35_MISS_TIMEOUT_MS": "500",
+    "STRATA_QWEN35_VISION": "1",
+    "STRATA_QWEN35_SAMPLE": "0",
+    "STRATA_K_PAIR": "0",
+    "CUDA_VISIBLE_DEVICES": "GPU-4d8d8556-98bb-c0e3-cb5f-dd3d5359defb",
+    "CUDA_DEVICE_ORDER": "PCI_BUS_ID"
+  },
+  "sampling": {
+    "temperature": 0,
+    "top_k": 20,
+    "top_p": 0.95,
+    "min_p": 0
+  },
+  "capabilities": {
+    "sampling": [
+      "greedy",
+      "temperature",
+      "top_k",
+      "top_p",
+      "min_p",
+      "penalties"
+    ],
+    "max_slots": 2,
+    "speculation": "optional-dspark",
+    "speculation_sampling": "greedy-only; sampled requests use ordinary decode",
+    "prefix_resume": false,
+    "images": true
+  },
+  "asset_binding": {
+    "path": "G:\\LM_Models\\openbmb\\MiniCPM-V-4.7-35B-A3B-gguf\\MiniCPM-V-4_7-35B-A3B-Q4_K_S.gguf",
+    "bytes": 19889400736,
+    "mtime_ns": 1791944896836474800,
+    "frontend": {
+      "chat_template.jinja": "c4531cacbf2a0ab65170433d7a4f371d11b7599cf96c04b192e6372432636c70",
+      "merges.txt": "080cf95432173729d160346b7882bd2a644b07f7a3813a3eb73f4e66787bfde9",
+      "tokenizer.json": "78b7c3bbd8ff54c5f961cc9d161bd6d702e671f9fe359debee9d1dd363120e8f",
+      "token_type.json": "c4bfd0a6b37ab167f0de06b4461515a228da06aa929fba6d4dbcfed159e7a6c0",
+      "vocab.json": "9e395f65168a6e3130b33949e0e311f787115e3f90cd7826b2004b71ed8f9348"
+    },
+    "metadata": {
+      "general.architecture": "qwen35moe",
+      "general.name": "35a3_hf_v47_0923",
+      "qwen35moe.block_count": 40,
+      "qwen35moe.context_length": 262144,
+      "qwen35moe.embedding_length": 2048,
+      "qwen35moe.expert_count": 256,
+      "qwen35moe.expert_used_count": 8,
+      "tokenizer.ggml.model": "gpt2",
+      "tokenizer.ggml.pre": "qwen35",
+      "general.file_type": 14
+    },
+    "tensor_contract": {
+      "tensor_count": 733,
+      "tensor_table_sha256": "a81e847d0e7d15abb206e11f56bcd9df31b14db4187b08326b8da95ce48081e2",
+      "quant_types": {
+        "Q6_K": 1,
+        "F32": 301,
+        "Q4_K": 417,
+        "Q5_K": 14
+      },
+      "data_offset": 10984608,
+      "checked": "shapes, formats, alignment and file extents; tensor payload not read",
+      "stop_ids": [
+        248046
+      ]
+    }
+  },
+  "validation_status": "bounded V100 API regression passed on 2026-10-16",
+  "vision": {
+    "exe": "F:\\Codex\\Strata_moe\\build\\vision\\bin\\Release\\strata-minicpm-vision.exe",
+    "model": "G:\\LM_Models\\openbmb\\MiniCPM-V-4.7-35B-A3B-gguf\\MiniCPM-V-4_7-35B-A3B-Q4_K_S.gguf",
+    "mmproj": "G:\\LM_Models\\openbmb\\MiniCPM-V-4.7-35B-A3B-gguf\\mmproj-model-f16.gguf",
+    "format": "minicpm_canvas",
+    "gpu": false,
+    "threads": 8,
+    "max_tokens": 1024
+  },
+  "draft": "G:\\LM_Models\\openbmb\\MiniCPM-V-4.7-35B-A3B-DSpark",
+  "gguf_python": "G:\\llama.cpp\\gguf-py",
+  "gpu": 1,
+  "dll_dirs": [
+    "F:\\Codex\\Strata_moe\\build\\sm70\\Release",
+    "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.8\\bin"
+  ],
+  "context_policy": {
+    "kind": "on-demand",
+    "initial_tokens": 8192,
+    "logical_context": 131072,
+    "ram_index_enabled": false
+  },
+  "speculation": {
+    "kind": "dspark",
+    "enabled": false,
+    "sampling": "greedy-only",
+    "sampled_fallback": "DSpark off for ordinary sampling"
+  },
+  "stop_token_ids": [
+    248046
+  ],
+  "regression_exe_sha256": "0270db1d13e153bd2f00785c2fa133156fac7f6675b7dffec6fac4387d773018"
+}

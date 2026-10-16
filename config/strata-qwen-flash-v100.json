@@ -1,0 +1,73 @@
+{
+  "exe": "F:\\Codex\\Strata_moe\\build\\sm70\\Release\\strata.exe",
+  "args": [
+    "--pack",
+    "F:\\Codex\\Strata_moe\\runtime\\packs\\q5",
+    "--max-context",
+    "262144",
+    "--kv",
+    "int8",
+    "--kv-resident",
+    "32768",
+    "--native",
+    "G:\\LM_Models\\Qwen3.8-Flash-Next-Uncensored-GGUF\\Qwen3.8-Flash-Next-Uncensored-Q5_K_M-00001-of-00003.gguf",
+    "--ple-gguf",
+    "G:\\LM_Models\\Qwen3.8-Flash-Next-Uncensored-GGUF\\Qwen3.8-Flash-Next-Uncensored-Q5_K_M-00001-of-00003.gguf",
+    "--prefill",
+    "8192",
+    "--spec",
+    "4",
+    "--expert-cache",
+    "auto",
+    "--expert-profile",
+    "F:\\Codex\\Strata_moe\\data\\expert-profile.bin",
+    "--vram-reserve-mib",
+    "4096",
+    "--mtp",
+    "F:\\Codex\\strata-v100-q5\\mtp-gguf-q8-rt",
+    "--mtp-window",
+    "32768",
+    "--suffix-draft",
+    "0",
+    "--vision"
+  ],
+  "cwd": "G:\\temp\\strata-mainline-integration-20261015\\temp",
+  "tokenizer": "F:\\Codex\\strata-v100-q5\\pack-q5\\tokenizer",
+  "model_name": "qwen-flash-q5-q8-strata",
+  "log": "G:\\temp\\strata-mainline-integration-20261015\\temp\\flash-engine.log",
+  "gpu": 1,
+  "host": "127.0.0.1",
+  "fit_max_tokens": false,
+  "lib_dirs": [
+    "F:\\Codex\\Strata_moe\\build\\sm70\\Release",
+    "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.8\\bin"
+  ],
+  "sampling": {
+    "temperature": 0,
+    "top_p": 0.95,
+    "top_k": 20,
+    "min_p": 0.0,
+    "presence_penalty": 0.0,
+    "repetition_penalty": 1.0
+  },
+  "env": {
+    "CUDA_VISIBLE_DEVICES": "GPU-4d8d8556-98bb-c0e3-cb5f-dd3d5359defb",
+    "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+    "STRATA_EXPERIMENTAL_NATIVE_BATCH": "1",
+    "TEMP": "G:\\temp\\strata-mainline-integration-20261015\\temp",
+    "TMP": "G:\\temp\\strata-mainline-integration-20261015\\temp",
+    "CUDA_CACHE_PATH": "G:\\temp\\strata-mainline-integration-20261015\\temp\\cuda-cache",
+    "STRATA_ARENA_PIN_GIB": "8"
+  },
+  "api_monitor": false,
+  "vision": {
+    "exe": "F:\\Codex\\strata-v100-q5\\build-vision\\bin\\Release\\strata-vision.exe",
+    "mmproj": "G:\\LM_Models\\Qwen3.8-Flash-Next-Uncensored-GGUF\\mmproj-Qwen3.8-Flash-Next-Uncensored-F16.gguf",
+    "model": "G:\\LM_Models\\Qwen3.8-Flash-Next-Uncensored-GGUF\\Qwen3.8-Flash-Next-Uncensored-Q5_K_M-00001-of-00003.gguf",
+    "gpu": true,
+    "max_tokens": 1024
+  },
+  "family": "qwen4exp",
+  "validation_status": "bounded V100 API regression passed on 2026-10-16",
+  "regression_exe_sha256": "0270db1d13e153bd2f00785c2fa133156fac7f6675b7dffec6fac4387d773018"
+}
