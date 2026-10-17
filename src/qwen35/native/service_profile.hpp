@@ -7,13 +7,25 @@
 #include "strata/qwen35/native/attention_verify_grouped.hpp"
 #include "strata/qwen35/native/attention_verify_padded.hpp"
 #include "ffn_shape_policy.hpp"
+#include <cstdio>
 
 namespace strata::qwen35::native {
 inline DenseLimits service_limits(int context, bool ram) {
     DenseLimits limits;
     limits.context = context;
-    limits.native32 = true; limits.joint_ffn = true;
-    limits.joint_projections = true; limits.folded_ffn = true;
+    int device = 0;
+    check_cuda(cudaGetDevice(&device), "Dense profile device");
+    const auto caps = capabilities(device);
+    const bool volta = caps.major == 7 && caps.minor == 0;
+    if (!volta && caps.major < 8)
+        throw std::invalid_argument("Dense service requires SM70 or the SM80+ staged provider");
+    // Volta's prepared PP32, joint and folded layouts keep their original admission.
+    // Other devices use the existing raw staged inventory with native tiny/vector
+    // operations and the architecture-selected cuBLAS/CUTLASS long-PP service.
+    limits.native32 = volta; limits.joint_ffn = volta;
+    limits.joint_projections = volta; limits.folded_ffn = volta;
+    std::fprintf(stderr, "strata_dense_profile sm=%d.%d native32=%d long_pp=%s\n",
+                 caps.major, caps.minor, int(volta), volta ? "volta-folded" : "staged-cublas-cutlass");
     limits.kv_q8 = true; limits.kv_initial_tokens = (std::min)(8192, context);
     if (ram) {
         limits.kv_ram_tokens = 32768;

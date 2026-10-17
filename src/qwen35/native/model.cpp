@@ -187,7 +187,14 @@ void DenseModel::decode(int position,cudaStream_t stream){
     head(hidden,stream);
 }
 void DenseModel::validate_captured_decode_pair() const{
-    if(!limits_.native32)throw std::invalid_argument("decode pair graph requires admitted native32 prefix");
+    if(!limits_.native32){
+        int device=0;check_cuda(cudaGetDevice(&device),"Dense graph admission device");
+        const auto caps=capabilities(device);
+        // Single-token replay uses raw vector operators and the same state/KV
+        // leases; it does not borrow Volta PP32's prepared weight/input planes.
+        if(caps.major<8||limits_.qkv_planes||limits_.joint_ffn||weights_.tiled_ffn())
+            throw std::invalid_argument("decode graph requires native32 or an unleased SM80+ staged profile");
+    }
     unsigned parity=2;
     for(const auto &r:states_)if(r.state){
         if(parity==2)parity=r.current;
