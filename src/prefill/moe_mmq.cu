@@ -140,7 +140,7 @@ bool supported(int t) {
         case GGML_TYPE_Q8_0:   // the draft layer's dense matrices (E-9)
 #ifdef STRATA_MMQ_KQUANTS
         case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K: case GGML_TYPE_Q5_1:   // Unsloth's UD-Q4_K_XL experts (CUDA)
-#if defined(__HIPCC__) || defined(STRATA_Q6K_EXPERTS)
+#if defined(__HIPCC__) || defined(STRATA_Q6K_EXPERTS) || defined(STRATA_NATIVE_MOE_Q6_MMQ)
         case GGML_TYPE_Q6_K:   // HIP: the dense GGUF projections (STRATA_DENSE_MMQ); CUDA: only the opt-in -DSTRATA_Q6K_EXPERTS=ON build
 #endif
 #endif
@@ -232,7 +232,7 @@ void Context::run(const Product& p, void* stream) {
 #ifdef STRATA_MMQ_KQUANTS
         case GGML_TYPE_Q4_K: STRATA_MUL_MAT_Q(GGML_TYPE_Q4_K)(ctx, a, s); break;
         case GGML_TYPE_Q5_K: STRATA_MUL_MAT_Q(GGML_TYPE_Q5_K)(ctx, a, s); break;
-#if defined(__HIPCC__) || defined(STRATA_Q6K_EXPERTS)
+#if defined(__HIPCC__) || defined(STRATA_Q6K_EXPERTS) || defined(STRATA_NATIVE_MOE_Q6_MMQ)
         case GGML_TYPE_Q6_K: STRATA_MUL_MAT_Q(GGML_TYPE_Q6_K)(ctx, a, s); break;
 #endif
         case GGML_TYPE_Q5_1: STRATA_MUL_MAT_Q(GGML_TYPE_Q5_1)(ctx, a, s); break;

@@ -38,5 +38,19 @@ class SlotContract(unittest.TestCase):
         self.assertEqual(runner.slot_status.view()[0]['state'], 'idle')
 
 
+    def test_backend_exit_uses_common_stream_error_contract(self):
+        import threading
+        from serve.server import EngineDied
+        engine = object.__new__(NativeFamilyEngine)
+        engine.info = {'dspark': False}
+        engine.request_state = threading.local()
+        engine.alive = lambda: False
+        def fail(*args, **kwargs):
+            raise RuntimeError('native engine output closed')
+        engine.runner = type('Runner', (), {'generate': staticmethod(fail)})()
+        with self.assertRaises(EngineDied):
+            next(engine.generate([1, 2], 4, {}, threading.Event()))
+
+
 if __name__ == '__main__':
     unittest.main()

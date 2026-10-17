@@ -135,6 +135,9 @@ class NativeFamilyEngine:
                 elif kind == "done":
                     return
                 else:
+                    if not self.alive():
+                        from serve.server import EngineDied
+                        raise EngineDied("native family engine exited during generation") from value
                     raise value
         finally:
             stop.set(); worker.join(timeout=10)
