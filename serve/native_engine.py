@@ -12,6 +12,7 @@ from typing import Callable
 
 
 from serve.native_sampling import parameters as sampling_parameters
+from serve.native_slots import NativeSlots
 
 
 class NativeFamilyRunner:
@@ -34,6 +35,7 @@ class NativeFamilyRunner:
         self.block_size = block_size
         self.dspark = dspark
         self.slots = slots
+        self.slot_status = NativeSlots(slots)
         self.available = queue.Queue(maxsize=slots)
         self.commands = queue.Queue()
         for slot in range(slots):
@@ -129,8 +131,13 @@ class NativeFamilyRunner:
                  stops: set[int], on_token: Callable[[int], None] | None = None,
                  cancel=None, sampling=None) -> tuple[list[int], dict]:
         slot = self.available.get()
+        self.slot_status.begin(slot, len(prompt_ids), max_new)
+        def report(token):
+            self.slot_status.token(slot)
+            if on_token:
+                on_token(token)
         try:
-            return self._generate(slot, prompt_ids, max_new, stops, on_token, cancel, sampling)
+            return self._generate(slot, prompt_ids, max_new, stops, report, cancel, sampling)
         finally:
             visual_path = getattr(prompt_ids, "visual_path", None)
             if visual_path:
@@ -142,6 +149,7 @@ class NativeFamilyRunner:
                 if not failed:
                     raise
             finally:
+                self.slot_status.release(slot)
                 self.available.put(slot)
 
     def _generate(self, slot: int, prompt_ids: list[int], max_new: int,

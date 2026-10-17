@@ -87,7 +87,10 @@ class NativeFamilyEngine:
             self.runner.close(); self.runner = None
 
     def slots_view(self):
-        return [{"id": slot, "state": "native"} for slot in range(self.batch)]
+        if self.runner is not None:
+            return self.runner.slot_status.view()
+        return [{"slot": slot, "id": slot, "state": "idle", "held_tokens": 0}
+                for slot in range(self.batch)]
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         if embeddings:
