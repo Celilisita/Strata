@@ -1,4 +1,5 @@
 #include "runtime.hpp"
+#include "runtime_memory.hpp"
 #include "mtp_sidecar.hpp"
 #include "mtp_drafter.hpp"
 #include "native_tg_graph.hpp"
@@ -159,7 +160,9 @@ bool Runtime::initialize(std::string& error, ggml_backend_sched_eval_callback ca
     model_params.lazy_mode = LLAMA_LAZY_MODE_ON;
     model_params.use_extra_bufts = false;
     model_params.load_mtp = false;
+    runtime_memory("before-model-load");
     model_ = llama_model_load_from_file(options_.model.c_str(), model_params);
+    runtime_memory("after-model-load");
     if (!model_) {
         error = "canonical DeepSeek4 model loading failed";
         return false;
@@ -221,7 +224,9 @@ bool Runtime::initialize_context(std::string& error, ggml_backend_sched_eval_cal
     context_params.no_perf = false;
     context_params.cb_eval = callback;
     context_params.cb_eval_user_data = data;
+    runtime_memory("before-context-init");
     context_ = llama_init_from_model(model_, context_params);
+    runtime_memory("after-context-init");
     if (!context_) {
         error = "canonical DeepSeek4 context initialization failed";
         return false;
@@ -238,6 +243,11 @@ bool Runtime::initialize_context(std::string& error, ggml_backend_sched_eval_cal
     llama_attach_threadpool(context_, threadpool_, threadpool_);
     if (options_.cache_leaf_aliases) configure_cache_leaf_aliases(context_);
     if (options_.pinned_experts) configure_expert_staging(context_, true, &retained_source_pin_,&retained_packed_);
+    const auto pin=source_pin_metrics();
+    std::fprintf(stderr,"strata_source_pin requested=%llu registered=%llu attempts=%llu failures=%llu last_error=%u register_ms=%.3f\n",
+        (unsigned long long)expert_source_pin_budget(),(unsigned long long)pin.registered_bytes,
+        (unsigned long long)pin.attempts,(unsigned long long)pin.failures,pin.last_error,pin.registration_wall_ns/1e6);
+    runtime_memory("after-source-provider");
     if(warming.valid()){
         page_warm_=warming.get();page_warm_->lock_pages();const auto& w=page_warm_->metrics();
         std::fprintf(stderr,"strata_expert_page_warm bytes=%llu pages=%llu read_ms=%.3f locked_bytes=%llu lock_failures=%llu lock_ms=%.3f working_set_adjusted=%d working_set_requested_bytes=%llu working_set_error=%llu checksum=%llu\n",
@@ -245,9 +255,11 @@ bool Runtime::initialize_context(std::string& error, ggml_backend_sched_eval_cal
             (unsigned long long)w.locked_bytes,(unsigned long long)w.lock_failures,w.lock_ms,w.working_set_adjusted?1:0,
             (unsigned long long)w.working_set_requested_bytes,(unsigned long long)w.working_set_error,(unsigned long long)w.checksum);
     }
+    runtime_memory("after-page-warm");
     if (options_.cold_threads) configure_cold_experts(context_, options_.cold_threads, options_.cold_admit_free != 0);
     if(mtp_enabled()){std::cerr<<"strata_mtp_stage=source_provider_ready\n"<<std::flush;llama_synchronize(context_);}
     if (device_expert_cache_requested()) configure_device_expert_cache(context_);
+    runtime_memory("after-device-cache");
     if(mtp_enabled()){std::cerr<<"strata_mtp_stage=expert_cache_ready\n"<<std::flush;llama_synchronize(context_);}
     return true;
 }
@@ -372,7 +384,7 @@ int Runtime::decode_tokens(const llama_token* tokens, size_t count, llama_pos st
     return 0;
 }
 
-bool Runtime::evaluate(const std::vector<llama_token>& tokens, std::string& error) {
+bool Runtime::evaluate(const std::vector<llama_token>& tokens, std::string& error, const std::atomic<bool>* cancel) {
     error.clear();
     if (tokens.empty()) {
         error = "empty input token sequence";
@@ -383,6 +395,7 @@ bool Runtime::evaluate(const std::vector<llama_token>& tokens, std::string& erro
         return false;
     }
     for (size_t offset = 0; offset < tokens.size();) {
+        if(cancel&&cancel->load()){error="request cancelled";return false;}
         const size_t count = std::min(size_t(llama_n_batch(context_)), tokens.size() - offset);
         const bool last = offset + count == tokens.size();
         if (decode_tokens(tokens.data() + offset, count, position_, last, error) != 0) return false;

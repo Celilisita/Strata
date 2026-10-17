@@ -1,6 +1,10 @@
 #include "runtime.hpp"
 #include "options.hpp"
 #include "device_cache.hpp"
+#include "serve_input.hpp"
+#include "serve_sampling.hpp"
+#include "runtime_memory.hpp"
+#include "serve_metrics.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -44,14 +48,8 @@ bool parse_ids(const std::string& value, std::vector<llama_token>& ids, bool ima
     return !ids.empty();
 }
 
-struct Request {
-    int limit = 0;
-    bool ignore_eog = false;
-    double temperature = 0.0;
-    double top_p = 1.0;
-    double min_p = 0.0;
-    int top_k = 64;
-    uint64_t seed = 0;
+struct Request : strata::deepseek_v4::ServeSampling {
+    int limit=0;
     std::string embeddings_path;
     std::vector<llama_token> ids;
 };
@@ -62,50 +60,12 @@ bool parse_number(const std::string& value, double& result) {
     return end != value.c_str() && *end == '\0' && std::isfinite(result);
 }
 
-llama_token sample_logits(Runtime& runtime, const Request& request, std::mt19937_64& rng) {
-    const float* logits = llama_get_logits_ith(runtime.context(), -1);
-    if (!logits) throw std::runtime_error("no output logits are available");
-    const int32_t count = llama_vocab_n_tokens(runtime.vocab());
-    if (count <= 0) throw std::runtime_error("model vocabulary is empty");
-    struct Candidate { float logit; llama_token id; };
-    const auto higher = [](const Candidate& a, const Candidate& b) { return a.logit > b.logit; };
-    std::priority_queue<Candidate, std::vector<Candidate>, decltype(higher)> best(higher);
-    for (int32_t id = 0; id < count; ++id) {
-        const float logit = logits[id];
-        if (std::isnan(logit) || logit == std::numeric_limits<float>::infinity())
-            throw std::runtime_error("non-finite output logits");
-        if (!std::isfinite(logit) || (request.ignore_eog && runtime.is_eog(id))) continue;
-        if (best.size() < size_t(request.top_k)) best.push({logit, id});
-        else if (logit > best.top().logit) { best.pop(); best.push({logit, id}); }
-    }
-    if (best.empty()) throw std::runtime_error("no finite output logits");
-    std::vector<Candidate> candidates;
-    candidates.reserve(best.size());
-    while (!best.empty()) { candidates.push_back(best.top()); best.pop(); }
-    std::sort(candidates.begin(), candidates.end(), higher);
-    std::vector<double> weights;
-    weights.reserve(candidates.size());
-    double total = 0.0;
-    for (const auto& item : candidates) {
-        const double weight = std::exp((double(item.logit) - candidates.front().logit) / request.temperature);
-        if (weight < request.min_p) break;
-        weights.push_back(weight);
-        total += weight;
-    }
-    if (weights.empty()) throw std::runtime_error("sampling removed every candidate");
-    double kept = 0.0;
-    size_t limit = 0;
-    do { kept += weights[limit++]; } while (limit < weights.size() && kept / total < request.top_p);
-    std::uniform_real_distribution<double> draw(0.0, kept);
-    const double target = draw(rng);
-    double cumulative = 0.0;
-    llama_token chosen = candidates[limit - 1].id;
-    for (size_t i = 0; i < limit; ++i) {
-        cumulative += weights[i];
-        if (target < cumulative) { chosen = candidates[i].id; break; }
-    }
+llama_token sample_logits(Runtime& runtime,const Request& request,std::mt19937_64& rng,
+                          const strata::deepseek_v4::ServeHistory& history){
+    const auto token=strata::deepseek_v4::serve_sample(llama_get_logits_ith(runtime.context(),-1),
+        llama_vocab_n_tokens(runtime.vocab()),request,history,rng,[&](llama_token id){return runtime.is_eog(id);});
     strata::deepseek_v4::idle_device_expert_cache(runtime.context());
-    return chosen;
+    return token;
 }
 
 bool parse_request(const std::string& line, Request& out, std::string& error) {
@@ -162,6 +122,17 @@ bool parse_request(const std::string& line, Request& out, std::string& error) {
                     return false;
                 }
                 out.top_k = int(parsed);
+            } else if(key=="penalty_repeat"||key=="penalty_freq"||key=="penalty_present"){
+                if(!parse_number(value,number)||(key=="penalty_repeat"&&number<=0)){
+                    error="invalid penalty value for "+key;return false;
+                }
+                if(key=="penalty_repeat")out.penalty_repeat=number;
+                else if(key=="penalty_freq")out.penalty_freq=number;
+                else out.penalty_present=number;
+            } else if(key=="penalty_last_n"){
+                char* end=nullptr;const long window=std::strtol(value.c_str(),&end,10);
+                if(end==value.c_str()||*end||window<0||window>262144){error="invalid penalty history window";return false;}
+                out.penalty_last_n=int(window);
             } else if (key == "seed") {
                 char* end = nullptr;
                 const unsigned long long parsed = std::strtoull(value.c_str(), &end, 10);
@@ -180,7 +151,7 @@ bool parse_request(const std::string& line, Request& out, std::string& error) {
     return true;
 }
 
-bool evaluate_image_prompt(Runtime& runtime, const Request& request, std::string& error) {
+bool evaluate_image_prompt(Runtime& runtime, const Request& request, std::string& error,const std::atomic<bool>* cancel) {
     std::ifstream file(request.embeddings_path, std::ios::binary);
     if (!file) { error = "cannot open image embeddings file"; return false; }
     const auto& ids = request.ids;
@@ -189,6 +160,7 @@ bool evaluate_image_prompt(Runtime& runtime, const Request& request, std::string
     size_t at = 0;
     size_t image_count = 0;
     while (at < ids.size()) {
+        if(cancel&&cancel->load()){error="request cancelled";return false;}
         size_t end = at + 1;
         const bool image = ids[at] == -1;
         while (end < ids.size() && (ids[end] == -1) == image) ++end;
@@ -198,6 +170,7 @@ bool evaluate_image_prompt(Runtime& runtime, const Request& request, std::string
             // non-causal blocks. The SVE records supply their boundaries.
             size_t remaining = count;
             while (remaining > 0) {
+                if(cancel&&cancel->load()){error="request cancelled";return false;}
                 std::array<int32_t, 5> header{};
                 if (!file.read(reinterpret_cast<char*>(header.data()), sizeof(header)) ||
                     header[0] != 0x31455653 || header[1] <= 0 ||
@@ -221,6 +194,7 @@ bool evaluate_image_prompt(Runtime& runtime, const Request& request, std::string
             }
         } else {
             for (size_t offset = at; offset < end;) {
+                if(cancel&&cancel->load()){error="request cancelled";return false;}
                 const size_t n = std::min<size_t>(runtime.options().n_batch, end - offset);
                 if (runtime.decode_tokens(ids.data() + offset, n, runtime.position(),
                                           offset + n == ids.size(), error) != 0) return false;
@@ -236,7 +210,7 @@ bool evaluate_image_prompt(Runtime& runtime, const Request& request, std::string
     return true;
 }
 
-int generate(Runtime& runtime, const Request& request) {
+int generate(Runtime& runtime, const Request& request,const std::shared_ptr<std::atomic<bool>>& cancel) {
     if (request.ids.size() + size_t(request.limit) > runtime.options().n_ctx) {
         std::puts("ERR request exceeds model context");
         return 0;
@@ -244,15 +218,23 @@ int generate(Runtime& runtime, const Request& request) {
     std::string error;
     llama_synchronize(runtime.context());
     runtime.reset(true);
+    const strata::deepseek_v4::ServeMetrics counters(runtime);
     const auto start = Clock::now();
     const bool evaluated = request.embeddings_path.empty()
-        ? runtime.evaluate(request.ids, error)
-        : evaluate_image_prompt(runtime, request, error);
+        ? runtime.evaluate(request.ids, error,cancel.get())
+        : evaluate_image_prompt(runtime, request, error,cancel.get());
+    if(!evaluated&&cancel->load()){
+        llama_synchronize(runtime.context());
+        std::printf("DONE 0 %zu %.3f 0 cancel 0 0 0\n",request.ids.size(),milliseconds(start));return 0;
+    }
     if (!evaluated) {
         std::printf("ERR %s\n", error.c_str());
         return 0;
     }
+    // Complete the request boundary before reporting PP, as the first sample requires.
+    llama_synchronize(runtime.context());
     const double pp_ms = milliseconds(start);
+    strata::deepseek_v4::runtime_memory("after-prefill");
     std::printf("PP %zu %zu %.3f %.3f\n", request.ids.size(), request.ids.size(),
                 pp_ms, request.ids.size() * 1000.0 / std::max(0.001, pp_ms));
     const auto tg_start = Clock::now();
@@ -260,25 +242,29 @@ int generate(Runtime& runtime, const Request& request) {
     int offered = 0;
     int accepted = 0;
     bool stopped = false;
+    strata::deepseek_v4::ServeHistory history(request,request.ids);
     auto send = [&](llama_token token) {
+        if(cancel->load())return;
+        history.remember(token);
         std::printf("T %d\n", token);
         ++emitted;
         stopped = !request.ignore_eog && runtime.is_eog(token);
     };
     // Greedy MTP verification cannot preserve a stochastic target distribution.
-    const bool use_mtp = request.temperature == 0.0 && runtime.mtp_enabled() && request.embeddings_path.empty();
+    const bool use_mtp = request.temperature == 0.0 && !request.penalties() && runtime.mtp_enabled() && request.embeddings_path.empty();
     std::mt19937_64 rng(request.seed ? request.seed : std::random_device{}());
-    auto choose = [&]() { return request.temperature > 0.0 ? sample_logits(runtime, request, rng)
+    auto choose = [&]() { return (request.temperature > 0.0 || request.penalties()) ? sample_logits(runtime, request, rng,history)
                                                        : runtime.greedy(request.ignore_eog); };
     if (use_mtp && request.limit > 1 && request.ids.size() >= 2) runtime.mtp_begin(request.ids);
-    llama_token pending = choose();
+    llama_token pending = cancel->load() ? 0 : choose();
     send(pending);
-    while (!stopped && emitted < request.limit) {
+    while (!stopped && emitted < request.limit && !cancel->load()) {
         if (!use_mtp || request.ids.size() < 2 || request.limit - emitted == 1) {
             if (runtime.decode_tokens(&pending, 1, runtime.position(), true, error)) {
                 std::printf("ERR %s\n", error.c_str());
                 return 0;
             }
+            if(cancel->load())break;
             pending = choose();
             send(pending);
             continue;
@@ -306,8 +292,10 @@ int generate(Runtime& runtime, const Request& request) {
         pending = bonus;
         send(bonus);
     }
+    if(cancel->load())llama_synchronize(runtime.context());
+    const auto tg_ms=milliseconds(tg_start);counters.report(runtime);
     std::printf("DONE %d %zu %.3f %.3f %s %d %d 0\n", emitted, request.ids.size(), pp_ms,
-                milliseconds(tg_start), stopped ? "stop" : "limit", accepted, offered);
+                tg_ms, cancel->load() ? "cancel" : stopped ? "stop" : "limit", accepted, offered);
     return 0;
 }
 }  // namespace
@@ -353,10 +341,12 @@ int strata_deepseek_v4_serve(int argc, char** argv) {
             std::fprintf(stderr, "strata deepseek_v4: %s\n", error.c_str());
             return 1;
         }
-        std::printf("INFO family=deepseek_v4 mtp=%d\nREADY %u\n", runtime->mtp_enabled() ? 1 : 0,
+        std::printf("INFO family=deepseek_v4 mtp=%d\nREADY %u stop\n", runtime->mtp_enabled() ? 1 : 0,
                     options.n_ctx);
-        std::string line;
-        while (std::getline(std::cin, line)) {
+        strata::deepseek_v4::ServeInput input;
+        std::string line;std::shared_ptr<std::atomic<bool>> cancel;
+        while (input.next(line,cancel)) {
+            strata::deepseek_v4::ServeInputLease lease{input,cancel};
             if (line == "QUIT" || line == "EXIT") break;
             try {
                 if (line.rfind("TOKENIZE ", 0) == 0) {
@@ -375,7 +365,7 @@ int strata_deepseek_v4_serve(int argc, char** argv) {
                     std::puts("ERR this engine was started without --vision");
                     continue;
                 }
-                generate(*runtime, request);
+                generate(*runtime, request,cancel);
             } catch (const std::exception& failure) {
                 std::printf("ERR %s\n", failure.what());
             }

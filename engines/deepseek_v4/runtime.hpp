@@ -7,6 +7,7 @@
 #include "llama.h"
 
 #include <array>
+#include <atomic>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -34,7 +35,7 @@ public:
                                      bool parse_special = true) const;
     std::string piece(llama_token token, bool special = false) const;
     std::string detokenize(const std::vector<llama_token>& tokens, bool special = false) const;
-    bool evaluate(const std::vector<llama_token>& tokens, std::string& error);
+    bool evaluate(const std::vector<llama_token>& tokens, std::string& error, const std::atomic<bool>* cancel=nullptr);
     bool decode_image(const float* rows, size_t count, llama_pos start_pos,
                       bool logits_last, std::string& error);
     int decode_tokens(const llama_token* tokens, size_t count, llama_pos start_pos,
