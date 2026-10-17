@@ -288,6 +288,11 @@ class Tokenizer:
         if b is None:
             if i < 0 or i >= len(self.tokens):
                 raise IndexError("token id %d is outside the vocabulary (%d)" % (i, len(self.tokens)))
+            # GGUF CONTROL and USER_DEFINED pieces are literal UTF-8, not
+            # byte-BPE symbols (for example the native DeepSeek DSML marker).
+            if self.token_types and i < len(self.token_types) and self.token_types[i] in (3, 4):
+                b = cache[i] = self.tokens[i].encode("utf-8")
+                return b
             raw = bytearray()
             for ch in self.tokens[i]:
                 v = UNICODE_TO_BYTE.get(ch)
