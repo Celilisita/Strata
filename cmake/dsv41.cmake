@@ -19,7 +19,8 @@ if(STRATA_BUILD_DSV41 AND NOT STRATA_HIP_GFX906)
                  src/dsv41/ds4_main.cpp src/dsv41/ds4_model.cu src/dsv41/ds4_kernels.cu
                  src/dsv41/ds4_vision.cu src/dsv41/ds4_gguf.cu src/dsv41/ds4_gguf_cpu.cpp
                  src/dsv41/ds4_iq.cu src/dsv41/ds4_iq_cpu.cpp src/dsv41/ds4_tq.cu
-                 src/dsv41/ds4_tq_cpu.cpp src/dsv41/ds4_gg_cpu.cpp src/dsv41/ds4_packinfo.cpp)
+                 src/dsv41/ds4_tq_cpu.cpp src/dsv41/ds4_gg_cpu.cpp src/dsv41/ds4_packinfo.cpp
+                 src/kernels/cpu/iq_avx2_dsv41.cpp)
 
   # the commit the binary was built from, readable with --version
   if(NOT STRATA_BUILD_ID AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/BUILD_ID)
@@ -50,7 +51,22 @@ if(STRATA_BUILD_DSV41 AND NOT STRATA_HIP_GFX906)
   endif()
 
   if(STRATA_NATIVE_EXPERTS)
-    # Strata's CPU trellis kernels (tq_cpu.hpp) for the experts on the CPU lane
+    # Strata's CPU expert kernels: the trellis lane (tq_cpu.cpp with its AVX-512 / AVX2 row kernels,
+    # merged with this engine) and the ggml block-type rows the host embedding reader uses (iq_avx512).
+    target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/tq_cpu.cpp src/kernels/cpu/tq_avx512.cpp
+                                              src/kernels/cpu/tq_avx2.cpp)
+    target_include_directories(strata_kernels_cpu PRIVATE
+                               ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cpu
+                               ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml)
+    if(MSVC)
+      set_source_files_properties(src/kernels/cpu/tq_cpu.cpp src/kernels/cpu/tq_avx512.cpp
+                                  PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
+      set_source_files_properties(src/kernels/cpu/tq_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+    else()
+      set_source_files_properties(src/kernels/cpu/tq_cpu.cpp src/kernels/cpu/tq_avx512.cpp PROPERTIES
+                                  COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
+      set_source_files_properties(src/kernels/cpu/tq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+    endif()
     target_link_libraries(strata-dsv41 PRIVATE strata_kernels_cpu)
     target_compile_definitions(strata-dsv41 PRIVATE STRATA_DSV41_TQ_CPU=1)
   endif()
