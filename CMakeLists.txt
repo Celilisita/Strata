@@ -1610,3 +1610,6 @@ include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/strata_titanrtx.cmake")
 
 # Completed families use the same source-built backend and normal frontend.
 include(cmake/completed_integrations.cmake)
+
+# DeepSeek-V4.1-Flash engine path (strata-dsv41), merged from upstream.
+include(cmake/dsv41.cmake)
