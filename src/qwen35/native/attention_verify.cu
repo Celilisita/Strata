@@ -76,7 +76,7 @@ __global__ void partial_attention(const float *query,const unsigned char *key,co
         __syncthreads();
     }
     wmma::fragment<wmma::accumulator,16,16,16,float> result[4];
-    float carry[6]={};
+    float carry[8]={};
     #pragma unroll
     for(int f=0;f<4;++f)wmma::fill_fragment(result[f],0.0f);
     for(int first=begin;first<end;first+=Keys){
@@ -118,7 +118,7 @@ __global__ void partial_attention(const float *query,const unsigned char *key,co
             for(int f=0;f<4;++f)wmma::store_matrix_sync(tile+(warp*4+f)*16,result[f],Dim,wmma::mem_col_major);
             __syncthreads();
             #pragma unroll
-            for(int row=0;row<3;++row){
+            for(int row=0;row<4;++row){
                 #pragma unroll
                 for(int d=0;d<2;++d)if(row<s.tokens)carry[row*2+d]+=tile[row*Dim+threadIdx.x+d*128];
             }
@@ -165,7 +165,7 @@ int verify_attention_partitions(int valid,int heads,DecodeRounding r){
     return std::min((valid+127)/128,std::min(1024,desired));
 }
 size_t verify_attention_workspace(PrefillAttentionShape s,int partitions){
-    if(s.dim!=Dim||s.tokens<2||s.tokens>3||s.query_heads<1||s.query_heads>256||partitions<1||partitions>1024)
+    if(s.dim!=Dim||s.tokens<2||s.tokens>4||s.query_heads<1||s.query_heads>256||partitions<1||partitions>1024)
         throw std::invalid_argument("invalid Q8 verify partial extent");
     return size_t(s.query_heads)*partitions*s.tokens*Partial*4;
 }

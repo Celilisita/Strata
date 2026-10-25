@@ -2,6 +2,7 @@
 #include "strata/qwen35/native/token_ops.hpp"
 #include "strata/qwen35/native/ffn.hpp"
 #include "codec.cuh"
+#include "q8_codec.cuh"
 #include <math_constants.h>
 #include <climits>
 
@@ -11,6 +12,7 @@ __global__ void embedding(Matrix m,const int *ids,float *out,size_t count){
     const size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;if(i>=count)return;
     const int token=ids[i/m.columns],column=i%m.columns;
     if(token<0 || token>=m.rows){out[i]=CUDART_NAN_F;return;}
+    if(m.quant==Quant::Q8){out[i]=q8_raw_value(m.data,m.columns,token,column);return;}
     const size_t block=size_t(token)*(m.columns/256)+column/256;
     out[i]=block_element(static_cast<const unsigned char *>(m.data)+block*(m.quant==Quant::Q4K?144:210),m.quant,column%256,m.layout);
 }
@@ -67,7 +69,10 @@ template<bool Batch> __global__ void pick_final(const GreedyPartial *parts,int n
 }
 }
 void gather_embedding(Matrix m,const int *ids,float *out,int tokens,cudaStream_t s){
-    matrix_bytes(m);if(!ids || !out || tokens<1 || tokens>8192)throw std::invalid_argument("invalid own embedding invocation");
+    matrix_bytes(m);
+    if(m.quant!=Quant::Q8&&m.quant!=Quant::Q4K&&m.quant!=Quant::Q6K)
+        throw std::invalid_argument("embedding format requires its registered GPU gather");
+    if(!ids || !out || tokens<1 || tokens>8192)throw std::invalid_argument("invalid own embedding invocation");
     const size_t n=size_t(tokens)*m.columns;embedding<<<unsigned((n+255)/256),256,0,s>>>(m,ids,out,n);
     check_cuda(cudaGetLastError(),"own device embedding gather");
 }
@@ -87,7 +92,7 @@ void greedy_pick(const float *x,int n,void *work,size_t bytes,int *token,unsigne
     check_cuda(cudaGetLastError(),"own greedy finite output selection");
 }
 void greedy_pick_batch(const float *x,int n,int rows,void *work,size_t bytes,int *ids,unsigned *invalid,cudaStream_t stream,TokenMask mask){
-    if(!x||!work||!ids||!invalid||rows<2||rows>3||bytes<size_t(rows)*greedy_workspace(n))
+    if(!x||!work||!ids||!invalid||rows<2||rows>4||bytes<size_t(rows)*greedy_workspace(n))
         throw std::invalid_argument("invalid owned batch greedy workspace");
     const int parts=(n+255)/256;
     if(mask.count<0||mask.count>16)throw std::invalid_argument("invalid batch greedy mask");

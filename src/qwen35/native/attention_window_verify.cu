@@ -9,7 +9,7 @@ namespace strata::qwen35::native {
 namespace {
 namespace wmma=nvcuda::wmma;
 constexpr int Dim=256,Rows=16,Keys=32,Pitch=272,ProbPitch=48,ScorePitch=40,Partial=258;
-constexpr int Group=3,LiveRows=Group*3;
+constexpr int Group=3,LiveRows=Group*4;
 __device__ float sum_warp(float x){
     for(int d=16;d;d/=2)x+=__shfl_xor_sync(0xffffffff,x,d);return x;
 }
@@ -147,7 +147,7 @@ __global__ void grouped_partial_attention(const float *query,const unsigned char
 }
 void window_verify_attention(const float *q,const void *k,const void *v,float *out,void *scratch,size_t bytes,
     PrefillAttentionShape s,const int *positions,int shift,int window,int partitions,cudaStream_t stream){
-    if(!q||!k||!v||!out||!scratch||!positions||s.tokens<2||s.tokens>3||s.dim!=256||
+    if(!q||!k||!v||!out||!scratch||!positions||s.tokens<2||s.tokens>4||s.dim!=256||
        s.kv_heads<1||s.query_heads%s.kv_heads||(s.query_heads/s.kv_heads)%3||
        bytes<size_t(s.query_heads)*partitions*s.tokens*258*4)
         throw std::invalid_argument("invalid sliding verify geometry");

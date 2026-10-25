@@ -232,6 +232,10 @@ inline bool block_geometry(uint32_t t, int& elems, int& bytes) {
         elems = 32;
         bytes = 17;
         return true;
+    case 40:   // NVFP4: four block16 E4M3 scales and 32 packed E2M1 bytes
+        elems = 64;
+        bytes = 36;
+        return true;
     case 42:
         elems = 64;
         bytes = 18;

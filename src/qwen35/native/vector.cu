@@ -65,6 +65,9 @@ __global__ void multiply(Matrix a, Matrix b, const ActivationBlock *input, float
 template<bool Pair>
 void launch(Matrix a, Matrix b, const void *input, float *first, float *second,
             float *activation, cudaStream_t stream) {
+    if((a.quant!=Quant::Q4K&&a.quant!=Quant::Q6K)||
+       (Pair&&b.quant!=Quant::Q4K&&b.quant!=Quant::Q6K))
+        throw std::invalid_argument("legacy vector projection accepts only Q4_K/Q6_K");
     const int blocks = a.rows;
     if (a.quant == Quant::Q4K) {
         constexpr int Parts = Pair ? 4 : 2;

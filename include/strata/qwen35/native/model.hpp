@@ -1,6 +1,7 @@
 #pragma once
 #include "strata/qwen35/native/weights.hpp"
 #include "strata/qwen35/native/token_ops.hpp"
+#include <chrono>
 #include <utility>
 #include "strata/qwen35/native/kv_ram.hpp"
 #include "strata/qwen35/native/mtp_position.hpp"
@@ -21,6 +22,8 @@ public:
         shared_->shared_ffn(32).enable_whole_k_q4_pair(tensor_bias);
     }
     void reserve_cache(int tokens,cudaStream_t);
+    // A new complete prefill follows graph release; reset_prefill before use.
+    void reserve_fresh_cache(int tokens,cudaStream_t);
     int cache_capacity()const{return cache_capacity_;}
     bool q8_cache()const{return limits_.kv_q8;}
     int kv_window()const{return limits_.kv_window_tokens;}
@@ -45,8 +48,10 @@ public:
     // Cold selection before eager execution or graph capture.
     void mask_tokens(const std::vector<int> &ids){token_mask_=make_token_mask(ids,int(spec_.n_vocab));}
     int masked_token_count()const{return token_mask_.count;}
-    void prefill(const int *device_ids,int tokens,cudaStream_t);
+    void prefill(const int *device_ids,int tokens,cudaStream_t,int start=0);
     void prefill_chunk(const int *device_ids,int start,int tokens,bool pick_last,cudaStream_t);
+    void begin_prefill_progress(int tokens,int base=0);
+    void suppress_prefill_progress(bool on){pp_suppress_=on;}
     // Fixed fresh PP capture: validate before replay, mark history1 afterward.
     void validate_captured_prefill(bool complete);
     // Consume the previous device-picked ID and extend existing SSM/KV state.
@@ -59,6 +64,12 @@ public:
     std::vector<ContinuationView> continuation_views(int valid) const;
     // Reset a fresh request; active KV rows are overwritten by PP before read.
     void reset_prefill(cudaStream_t);
+    // Keep host KV rows for a repeated prompt prefix; no recurrent reset.
+    void resume_kv(int valid,cudaStream_t);
+    // Chunk-boundary recurrent snapshot: a shorter common prefix can rewind
+    // here because the linear recurrence has no per-token undo.
+    int checkpoint_position()const{return checkpoint_position_;}
+    void restore_checkpoint(cudaStream_t);
     const float *logits() const { return logits_; }
     const float *final_norm() const { return final_norm_; }
     const int *picked_token() const { return picked_; }
@@ -66,7 +77,7 @@ public:
     size_t workspace_bytes() const { return storage_.bytes()+shared_->workspace_bytes(); }
     CacheSnapshot cache_snapshot(int index) const;
     int max_tokens() const { return limits_.max_tokens; }
-    void use_pp_gemm(DenseGemm *service,bool ffn=true,bool projections=true){shared_->use_pp_gemm(service,ffn,projections);}
+    void use_pp_gemm(DenseGemm *service,bool ffn=true,bool projections=true){shared_->use_pp_gemm(service,ffn,projections);head_service_=service;}
     void use_pp_attention_gemm(DenseGemm *service){attention_->use_pp_attention_gemm(service);}
     void enable_tiny_batches(){shared_->enable_tiny_batches();}
     void enable_tiny_row_ffn(){shared_->enable_tiny_row_ffn();}
@@ -88,10 +99,12 @@ private:
     friend class ServiceDecodeGraph;
     friend class MtpGraphs;
     int cache_capacity_=0;bool prefilling_=false;
+    int pp_total_=0,pp_base_=0;bool pp_suppress_=false;std::chrono::steady_clock::time_point pp_started_{};
     strata::qwen35::Spec spec_;const DenseWeights &weights_;DenseLimits limits_;
     DeviceStorage storage_;
     std::unique_ptr<RecurrentLayer> shared_;
     std::unique_ptr<AttentionLayer> attention_;
+    DenseGemm *head_service_=nullptr;
     struct State { float *history[2]{},*state=nullptr;unsigned current=0; };
     struct Cache { void *key=nullptr,*value=nullptr;std::unique_ptr<RamKvCache> ram; };
     std::vector<State> states_;std::vector<Cache> caches_;
@@ -108,5 +121,9 @@ private:
     const GdnPrefix *mtp_prefix_=nullptr;
     const DecodeCapture *decode_capture_=nullptr;
     std::unique_ptr<DenseVisualInput> visual_;
+    void save_checkpoint(int position,cudaStream_t);
+    std::vector<void*> checkpoint_state_,checkpoint_history0_,checkpoint_history1_;
+    std::vector<int> checkpoint_current_;
+    void *checkpoint_=nullptr;size_t checkpoint_bytes_=0;int checkpoint_position_=-1;
 };
 }

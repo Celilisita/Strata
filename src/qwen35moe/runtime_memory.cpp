@@ -1,12 +1,15 @@
 #include "strata/qwen35moe/runtime.hpp"
+#include "strata/qwen35moe/nvfp4_expert_state.hpp"
 #include "mtp_state.hpp"
 #include "moe_graph_state.hpp"
 #include "sampling_state.hpp"
+#include "head_readback.hpp"
 #include "session_state.hpp"
 #include "visual_state.hpp"
 #include "strata/qwen35moe/cpu_state.hpp"
 #include "strata/qwen35moe/attention_tile.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/native_dense_q4_row2.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -98,7 +101,7 @@ Runtime::Runtime(const std::string& model_path, int max_context, bool enable_exp
     if (properties.major < 7)
         throw std::runtime_error("Qwen3.6 kernels require CUDA compute capability 7.0 or newer");
     if (max_context < 1 || max_context > kAttentionMaxContext)
-        throw std::invalid_argument("Qwen3.6 context capacity must be 1..196608");
+        throw std::invalid_argument("Qwen3.6 context capacity must be 1..262144");
     std::string error;
     if (!load_spec(gguf_, spec_, error)) throw std::runtime_error(error);
     if (uint64_t(max_context_) > spec_.context_length)
@@ -128,6 +131,19 @@ Runtime::Runtime(const std::string& model_path, int max_context, bool enable_exp
     const char* prefill_tc = std::getenv("STRATA_QWEN35_PREFILL_TC");
     prefill_tc_ = !prefill_tc || std::string(prefill_tc) != "0";
     prefill_config_ = PrefillConfig::environment();
+    const bool fp4_requested=nvfp4_expert_flag(std::getenv("STRATA_QWEN35_MOE_NVFP4"));
+    const bool fp4_weights=nvfp4_main_stack(spec_);
+    if (fp4_requested!=fp4_weights)
+        throw std::invalid_argument("NVFP4 opt-in and converted main-stack GGUF must match");
+    if (fp4_weights) {
+        if(properties.major!=12 || properties.minor!=0 || mtp_enabled_ || !enable_expert_cache_)
+            throw std::invalid_argument("NVFP4 first slice requires SM120, expert cache and MTP0");
+        if(prefill_config_.prefix_stage || prefill_config_.expert_prefetch ||
+           prefill_config_.gu_copy_wave || prefill_config_.expert_copy_runs || prefill_config_.expert_copy_stage ||
+           prefill_config_.mapped_pp || prefill_config_.down_input_fused)
+            throw std::invalid_argument("NVFP4 requires legacy untyped expert copy/fusion paths off");
+        nvfp4_=std::make_unique<Nvfp4ExpertState>(gguf_,spec_);
+    }
     if (const char* raw = std::getenv("STRATA_QWEN35_RETENTION_PLAN")) {
         const std::string value(raw);
         if (value != "0" && value != "1") throw std::invalid_argument("retention plan requires0 or1");
@@ -143,8 +159,11 @@ Runtime::Runtime(const std::string& model_path, int max_context, bool enable_exp
     routed_tc_enabled_ = !routed || std::string(routed) != "0";
     const char* gathered = std::getenv("STRATA_QWEN35_GATHERED_GU");
     routed_gu_gathered_ = gathered && std::string(gathered) == "1";
+    if(nvfp4_)routed_tc_enabled_=false; // The NVFP4 provider owns its typed grouped launches.
     const char* scan = std::getenv("STRATA_QWEN35_PREFILL_SCAN");
     prefill_scan_ = !scan || std::string(scan) != "0";
+    const bool use_head_readback = HeadReadback::enabled(
+        nvfp4_ && gpu_head_ && properties.major == 12 && properties.minor == 0);
     cuda_check(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "create Qwen35 stream");
     // Large configured contexts reserve actual request K/V at a drained
     // request boundary. Small contexts keep the accepted allocation policy.
@@ -163,14 +182,23 @@ Runtime::Runtime(const std::string& model_path, int max_context, bool enable_exp
         head_partials_.reset(((spec_.n_vocab + 4095) / 4096) * sizeof(HeadPick));
         head_pick_buffer_.reset(sizeof(HeadPick));
     }
+    if (use_head_readback)
+        head_readback_ = std::make_unique<HeadReadback>(stream_);
 }
 
 Runtime::~Runtime() {
+    if(nvfp4_&&nvfp4_->tg_admission&&decode_phase_){try{finish_decode();}catch(...){}}
+    gu_copy_.reset(); // Complete direct GU copies before cache/GGUF release.
+    expert_prefetch_.reset(); // Drain copy reads before releasing GGUF/cache ownership.
     if (stream_) cudaStreamSynchronize(stream_);
+    head_readback_.reset(); // The existing drain completes every pick D2H before host release.
+    if (miss_service_) miss_service_->stop(); // CPU globals belong to nvfp4_; join even after a CUDA error.
     projection_mmq_.reset();
     batch_.down_mmq.reset();
+    nvfp4_.reset(); // Ordered work drained; release control leases before stream/mapping.
     moe_graph_.reset();
     miss_service_.reset();
+    host_readonly_.clear(); // Stream and CPU misses drained; GGUF mapping remains alive.
     mtp_.reset();
     dense_profile_.clear();
     if (diag_route_ready_) cudaEventDestroy(diag_route_ready_);
@@ -224,6 +252,11 @@ void Runtime::project(const GpuWeight& weight, const void* input_q8, float* outp
                       int n_in, int n_out) {
     if (!kernels::native_mmvq_supported(weight.type))
         throw std::runtime_error("unsupported Qwen35 projection type " + std::to_string(weight.type));
+    static const bool row2 = kernels::native_dense_q4_row2_enabled(std::getenv("STRATA_QWEN35_TG_DENSE_Q4_ROW2"));
+    if (row2 && kernels::native_dense_q4_row2_eligible(decode_phase_, weight.type, n_in, n_out)) {
+        kernels::native_q4_k_dense_row2(weight.ptr(), input_q8, output, n_in, n_out, 1, stream_);
+        return;
+    }
     kernels::native_mmvq(weight.type, weight.ptr(), input_q8, output, n_in, n_out, 1, stream_);
 }
 

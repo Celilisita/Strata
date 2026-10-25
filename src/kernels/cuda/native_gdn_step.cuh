@@ -1,10 +1,14 @@
 // Canonical GDN recurrence; Columns only shares read-only Q/K/gate loads.
-template<bool Scan, bool Prefix = false, int Columns = 1>
+template<bool Scan, bool Prefix = false, int Columns = 1, bool InputAlpha = false>
 __global__ void __launch_bounds__(128, 2)
 step(float* __restrict__ state, const float* __restrict__ q, const float* __restrict__ k,
      const float* __restrict__ v, const float* __restrict__ gate, const float* __restrict__ beta,
      float* __restrict__ output, int h_k, int h_v, float scale, int tokens, int input_stride,
      float* __restrict__ prefix) {
+    static_assert(Columns == 1 || Columns == 2 || Columns == 4 || Columns == 8,
+                  "GDN column tile must be 1, 2, 4 or 8");
+    static_assert(S % (4 * Columns) == 0, "GDN column tiles must cover the state exactly");
+    static_assert(Columns == 1 || (Scan && !Prefix), "multi-column tiles require ordinary scan");
     const int head = blockIdx.x;
     const int lane = threadIdx.x;
     const int col = (blockIdx.z * blockDim.y + threadIdx.y) * Columns;
@@ -25,7 +29,7 @@ step(float* __restrict__ state, const float* __restrict__ q, const float* __rest
             k_reg[r] = k[size_t(t) * input_stride + q_head * S + i];
             q_reg[r] = q[size_t(t) * input_stride + q_head * S + i];
         }
-        const float g_val = expf(gate[size_t(t) * h_v + head]);
+        const float g_val = InputAlpha ? gate[size_t(t) * h_v + head] : expf(gate[size_t(t) * h_v + head]);
 #pragma unroll
         for (int c = 0; c < Columns; ++c) {
             float kv_shard = 0.0f;

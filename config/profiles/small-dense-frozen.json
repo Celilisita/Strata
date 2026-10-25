@@ -1,0 +1,109 @@
+{
+  "schema_version": 1,
+  "scope": "Frozen small dense model profiles. Selection is explicit at instance initialization; no default SM120 activation.",
+  "features_off_default": {
+    "pp_half_cache": 0,
+    "device_greedy": 0,
+    "projection_fusion": 0,
+    "compact_async": 0,
+    "norm_fusion": 0
+  },
+  "profiles": [
+    {
+      "id": "minicpm5-2b-sm70-accepted",
+      "model": "minicpm5-2b",
+      "gguf_architecture": "llama",
+      "quantization": "Q4_K_M",
+      "device_evidence": "TITAN V",
+      "compute_capability": 70,
+      "automatic_selection": false,
+      "context": 131072,
+      "max_output": 65536,
+      "budget_mib": 12000,
+      "chunk": 512,
+      "features": {
+        "pp_half_cache": 1,
+        "device_greedy": 1,
+        "projection_fusion": 1,
+        "compact_async": 0,
+        "norm_fusion": 0
+      },
+      "norm_fusion_scope": "disabled",
+      "feature_off_fallback": "all feature values 0: original graph/projection/readback path",
+      "quality_limit": "Accepted functionality with recorded long tutorial/translation/visual quality limits; not a general quality pass",
+      "SM120_performance_or_quality_inherited": false
+    },
+    {
+      "id": "qwen3.5-0.8b-sm70-accepted",
+      "model": "qwen3.5-0.8b",
+      "gguf_architecture": "qwen35",
+      "quantization": "Q8_0",
+      "device_evidence": "TITAN V",
+      "compute_capability": 70,
+      "automatic_selection": false,
+      "context": 262144,
+      "max_output": 65536,
+      "budget_mib": 12000,
+      "chunk": 512,
+      "features": {
+        "pp_half_cache": 1,
+        "device_greedy": 1,
+        "projection_fusion": 1,
+        "compact_async": 1,
+        "norm_fusion": 1
+      },
+      "norm_fusion_scope": "Qwen PP only; TG keeps SCALE",
+      "feature_off_fallback": "all feature values 0: original graph/projection/readback path",
+      "quality_limit": "Accepted functionality with recorded long tutorial/translation/visual quality limits; not a general quality pass",
+      "SM120_performance_or_quality_inherited": false
+    },
+    {
+      "id": "minicpm5-2b-sm75-accepted",
+      "model": "minicpm5-2b",
+      "gguf_architecture": "llama",
+      "quantization": "Q4_K_M",
+      "device_evidence": "TITAN RTX",
+      "compute_capability": 75,
+      "automatic_selection": false,
+      "context": 131072,
+      "max_output": 65536,
+      "budget_mib": 12000,
+      "chunk": 512,
+      "features": {
+        "pp_half_cache": 1,
+        "device_greedy": 1,
+        "projection_fusion": 1,
+        "compact_async": 0,
+        "norm_fusion": 0
+      },
+      "norm_fusion_scope": "disabled",
+      "feature_off_fallback": "all feature values 0: original graph/projection/readback path",
+      "quality_limit": "Accepted functionality with recorded long tutorial/translation/visual quality limits; not a general quality pass",
+      "SM120_performance_or_quality_inherited": false
+    },
+    {
+      "id": "qwen3.5-0.8b-sm75-accepted",
+      "model": "qwen3.5-0.8b",
+      "gguf_architecture": "qwen35",
+      "quantization": "Q8_0",
+      "device_evidence": "TITAN RTX",
+      "compute_capability": 75,
+      "automatic_selection": false,
+      "context": 262144,
+      "max_output": 65536,
+      "budget_mib": 12000,
+      "chunk": 512,
+      "features": {
+        "pp_half_cache": 1,
+        "device_greedy": 1,
+        "projection_fusion": 1,
+        "compact_async": 1,
+        "norm_fusion": 1
+      },
+      "norm_fusion_scope": "Qwen PP only; TG keeps SCALE",
+      "feature_off_fallback": "all feature values 0: original graph/projection/readback path",
+      "quality_limit": "Accepted functionality with recorded long tutorial/translation/visual quality limits; not a general quality pass",
+      "SM120_performance_or_quality_inherited": false
+    }
+  ]
+}

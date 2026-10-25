@@ -1,4 +1,5 @@
 #include "strata/qwen35moe/runtime.hpp"
+#include "strata/qwen35moe/cache_peak_budget.hpp"
 #include "strata/qwen35moe/attention_tile.hpp"
 #include "mtp_state.hpp"
 #include "session_state.hpp"
@@ -12,7 +13,10 @@ void Runtime::reserve_context(int tokens, Metrics& metrics, int prefill_capacity
     if (prefill_capacity < 0 || prefill_capacity > 8192)
         throw std::invalid_argument("invalid reserved prefill capacity");
     const int desired = (std::max)(prefill_capacity, (std::max)(1024, batch_.capacity));
-    if (max_context_ <= 16384 && desired == prefill_budget_capacity_) return;
+    const bool peak_refit=max_context_>16384&&max_context_<=196608&&cache_peak_enabled()&&cache_peak_reuse_workspace()&&
+        cache_peak_ready(batch_,desired,!sessions_,mtp_enabled_,prefill_tc_,prefill_scan_,
+            tile_attention_,!batch_failed_,!gpu_head_||bool(sampling_)||bool(minicpm_sampler_),stream_,bool(nvfp4_));
+    if (max_context_ <= 16384 && desired == prefill_budget_capacity_ && !peak_refit) return;
     // MTP owns a second K/V pair per parked session. Keep its prior
     // single-session reservation contract until both MTP pairs can grow.
     if (decode_phase_ || host_pick_.id != -1 || (sessions_ && mtp_))
@@ -25,7 +29,7 @@ void Runtime::reserve_context(int tokens, Metrics& metrics, int prefill_capacity
     if (target < kv_capacity_ && (kv_capacity_ <= 16384 ||
         expert_cache_.slots == expert_sources_.size() * 256)) target = kv_capacity_;
     const bool resize_kv = target != kv_capacity_;
-    if (!resize_kv && desired == prefill_budget_capacity_) return;
+    if (!resize_kv && desired == prefill_budget_capacity_ && !peak_refit) return;
     size_t old_context = 0, new_context = 0;
     auto plan = [&](const LayerWeights& layer, size_t parked_bytes) {
         if (!layer.k_cache.bytes()) return;
@@ -47,6 +51,7 @@ void Runtime::reserve_context(int tokens, Metrics& metrics, int prefill_capacity
         expert_cache_.data.bytes() + old_context, new_context, target, desired) : 0;
     if (slots && slots < size_t(resident_layers_) * 256 + 8)
         throw std::invalid_argument("context budget cannot preserve resident expert layers");
+    prefetch_drain();
     cuda_check(cudaStreamSynchronize(stream_), "drain context reservation");
     batch_failed_ = true;
     // Shrinking compacts retained quantized bytes on GPU, then frees only tail

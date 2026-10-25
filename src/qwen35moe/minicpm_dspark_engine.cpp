@@ -2,6 +2,9 @@
 #include "strata/models/native_options.hpp"
 #include "strata/models/request_sampling.hpp"
 
+#include <cuda_profiler_api.h>
+#include "native_step_observation.hpp"
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -123,21 +126,98 @@ struct SlotSampling : strata::models::RequestSampling {
     }
 };
 
+// Process-local CUDA-profiler ranges; external tooling/CLI options remain separate.
+bool cuda_trace_ranges_enabled() {
+    const char* value = std::getenv("STRATA_QWEN35_CUDA_TRACE_RANGES");
+    if (!value || std::string(value) == "0") return false;
+    if (std::string(value) == "1") return true;
+    throw std::invalid_argument("STRATA_QWEN35_CUDA_TRACE_RANGES must be unset, 0 or 1");
+}
+
+class CudaTraceRanges {
+public:
+    explicit CudaTraceRanges(bool enabled) : enabled_(enabled) {}
+    ~CudaTraceRanges() { stop("scope-exit"); }
+    CudaTraceRanges(const CudaTraceRanges&) = delete;
+    CudaTraceRanges& operator=(const CudaTraceRanges&) = delete;
+    void select_slot(int slot) { if (armed_ && slot != slot_) stop("session-switch"); }
+    void begin_prefill(int slot, size_t tokens, bool eligible) {
+        if (!enabled_) return;
+        stop("prepare");
+        const int index = tokens == 8192 ? 0 : tokens == 30000 ? 1 : -1;
+        if (failed_ || !eligible || index < 0 || claimed_[size_t(index)]) return;
+        claimed_[size_t(index)] = true; armed_ = prefill_ = true; slot_ = slot; tokens_ = tokens;
+        warm_ = captured_ = errors_ = 0; start_code_ = stop_code_ = -1;
+        start();
+    }
+    void end_prefill() {
+        if (!armed_ || !prefill_) return;
+        const int slot = slot_;
+        stop("prefill-complete");
+        if (failed_) return;
+        armed_ = true; prefill_ = false; slot_ = slot;
+        warm_ = captured_ = errors_ = 0; start_code_ = stop_code_ = -1;
+        log("arm", "await-warmup");
+    }
+    void before_step(int slot) {
+        if (!armed_ || prefill_) return;
+        if (slot != slot_) { stop("session-switch"); return; }
+        if (warm_ == 8 && !running_) start();
+    }
+    void after_step(int slot) {
+        if (!armed_ || prefill_ || slot != slot_) return;
+        if (!running_) { ++warm_; return; }
+        if (++captured_ == 8) stop("window-complete");
+    }
+    void stop(const char* reason) noexcept {
+        if (!armed_ && !running_) return;
+        if (running_) {
+            stop_code_ = int(cudaProfilerStop());
+            if (stop_code_ != int(cudaSuccess)) { ++errors_; failed_ = true; }
+        }
+        log("end", reason); running_ = armed_ = false; slot_ = -1;
+    }
+private:
+    void start() noexcept {
+        start_code_ = int(cudaProfilerStart()); running_ = true;
+        if (start_code_ != int(cudaSuccess)) {
+            ++errors_; failed_ = true; stop("start-error"); return;
+        }
+        log("begin", prefill_ ? "prefill" : "warmup-complete");
+    }
+    void log(const char* event, const char* reason) const noexcept {
+        std::fprintf(stderr, "qwen35_cuda_trace_range event=%s phase=%s reason=%s slot=%d "
+            "input_tokens=%zu warm_steps=%u requested_steps=%u captured_steps=%u "
+            "cuda_errors=%u start_code=%d stop_code=%d diagnostic=1 fair_PP_TG=0 GPU_busy_measured=0\n",
+            event, prefill_ ? "PP" : "TG", reason, slot_, tokens_, warm_, prefill_ ? 0u : 8u,
+            captured_, errors_, start_code_, stop_code_);
+        std::fflush(stderr);
+    }
+    bool enabled_, armed_ = false, running_ = false, prefill_ = false, failed_ = false;
+    std::array<bool, 2> claimed_{false, false};
+    int slot_ = -1, start_code_ = -1, stop_code_ = -1;
+    size_t tokens_ = 0;
+    unsigned warm_ = 0, captured_ = 0, errors_ = 0;
+};
+
 void request(Runtime& runtime, DsparkVerifyState& verify, const std::string& aux_path,
              const std::string& line, std::array<int, 2>& positions,
              std::array<int, 2>& pendings, std::array<bool, 2>& active,
              std::array<SlotSampling, 2>& sampling,
-             bool dspark_enabled, bool& decode_started) {
+             std::array<std::vector<int>, 2>& snapshots, std::array<bool, 2>& resumables,
+             bool dspark_enabled, bool& decode_started, CudaTraceRanges& trace) {
     std::istringstream input(line);
     std::string command, csv, extra;
     if (!(input >> command)) throw std::invalid_argument("empty DSpark command");
     int slot = -1;
     if (!(input >> slot) || slot < 0 || slot >= runtime.session_capacity())
         throw std::invalid_argument("invalid MiniCPM request slot");
+    trace.select_slot(slot);
     int& position = positions[size_t(slot)];
     int& pending = pendings[size_t(slot)];
     auto& sampler = sampling[size_t(slot)];
     if (command == "CONFIG") {
+        trace.stop("config");
         if (active[size_t(slot)]) throw std::invalid_argument("MiniCPM slot is active");
         sampler = SlotSampling{};
         sampler.configure(input, runtime.max_context());
@@ -145,6 +225,7 @@ void request(Runtime& runtime, DsparkVerifyState& verify, const std::string& aux
         return;
     }
     if (command == "PREPARE" || command == "PREPAREV") {
+        trace.stop("prepare-command");
         int max_new = 0;
         if (!(input >> max_new >> csv) || input >> extra)
             throw std::invalid_argument("expected PREPARE max_new prompt_ids");
@@ -172,40 +253,111 @@ void request(Runtime& runtime, DsparkVerifyState& verify, const std::string& aux
             for (int id = 0; id < 2; ++id) {
                 runtime.select_session(id);
                 runtime.reset_session();
+                resumables[size_t(id)] = false;
+                snapshots[size_t(id)].clear();
             }
+        }
+        // A repeated prefix keeps its K/V and GDN state; the linear recurrence
+        // cannot rewind per token, so only a full-prefix match resumes.
+        int resume = 0;
+        auto& snapshot = snapshots[size_t(slot)];
+        if (command == "PREPARE" && resumables[size_t(slot)] && !snapshot.empty() &&
+            runtime.reserved_context() >= int(prompt.size()) + max_new) {
+            const size_t limit = (std::min)(snapshot.size(), prompt.size());
+            size_t common = 0;
+            while (common < limit && snapshot[common] == prompt[common]) ++common;
+            if (common == snapshot.size() && common < prompt.size()) resume = int(common);
+            else if (runtime.prefill_checkpoint() > 0 &&
+                     size_t(runtime.prefill_checkpoint()) <= common) resume = runtime.prefill_checkpoint();
         }
         if (decode_started) { runtime.finish_decode(); decode_started = false; }
         runtime.select_session(slot);
-        runtime.reset_session();
-        if (command == "PREPAREV") runtime.set_visual_input(std::move(visual));
+        runtime.reset_session(resume > 0);
+        if (resume > 0 && resume == runtime.prefill_checkpoint()) runtime.restore_prefill_checkpoint();
+        resumables[size_t(slot)] = false;
         Metrics metrics;
         const auto started = Clock::now();
         const int chunk = runtime.preferred_prefill_capacity(int(prompt.size()));
         runtime.reserve_context(int(prompt.size()) + max_new, metrics,
                                 (std::min)(chunk, int(prompt.size())));
         runtime.prepare_batch((std::max)(16, (std::min)(chunk, int(prompt.size()))));
-        PromptAux aux(dspark_enabled ? prompt.size() : 0);
-        if (dspark_enabled) runtime.set_checkpoint_sink(&aux);
+        // The visual rows are bounded by the context reserved just above.
+        if (command == "PREPAREV") runtime.set_visual_input(std::move(visual));
+        const bool draft_request = dspark_enabled && !sampler.enabled();
+        PromptAux aux(draft_request ? prompt.size() : 0);
+        if (draft_request) runtime.set_checkpoint_sink(&aux);
         SinkGuard guard{runtime};
-        const int anchor = prompt.size() > size_t(chunk)
-            ? runtime.run_prefill_long(prompt.data(), int(prompt.size()), metrics, chunk)
-            : runtime.run_prefill(prompt.data(), int(prompt.size()), "", metrics);
+        // Live PP progress: the long prefill reports layer completions at
+        // existing route drains, so no extra device events are added.
+        struct PpProgress {
+            Clock::time_point start;
+            int tokens = 0;
+            int step = -1;
+        } pp{Clock::now(), int(prompt.size())};
+        auto pp_report = [](void* context, int completed, int total) {
+            auto& s = *static_cast<PpProgress*>(context);
+            if (total < 1) return;
+            const int step = completed * 20 / total;
+            if (step == s.step) return;
+            s.step = step;
+            const double ms = std::chrono::duration<double, std::milli>(Clock::now() - s.start).count();
+            const int done = int(static_cast<long long>(s.tokens) * completed / total);
+            std::printf("PP %d %d %.0f %.1f\n", done, s.tokens, ms, ms > 0 ? 1000.0 * done / ms : 0.0);
+            std::fflush(stdout);
+        };
+        static const bool pp_progress = [] {
+            const char* flag = std::getenv("STRATA_QWEN35_PP_PROGRESS");
+            return !flag || flag[0] != '0';
+        }();
+        const PrefillObserver observer{pp_progress ? &pp : nullptr, pp_report};
+        trace.begin_prefill(slot, prompt.size(), command == "PREPARE" && !draft_request);
+        const int tail = int(prompt.size()) - resume;
+        // A client that drops generated reasoning leaves the next prompt a few
+        // template tokens short of this one's end. Stop just before the render
+        // tail so the recurrent snapshot stays at or below that common prefix.
+        const int split = (resume == 0 && tail > 128) ? tail - 16 : 0;
+        int anchor = 0;
+        if (split > 0) {
+            anchor = split > chunk
+                ? runtime.run_prefill_long(prompt.data(), split, metrics, chunk, &observer, 0)
+                : runtime.run_prefill(prompt.data(), split, "", metrics, &observer, 0);
+            runtime.save_prefill_checkpoint(split);
+            anchor = runtime.run_prefill(prompt.data() + split, tail - split, "", metrics, nullptr, split);
+        } else {
+            anchor = tail > chunk
+                ? runtime.run_prefill_long(prompt.data() + resume, tail, metrics, chunk, &observer, resume)
+                : runtime.run_prefill(prompt.data() + resume, tail, "", metrics, &observer, resume);
+        }
+        trace.end_prefill();
         runtime.set_checkpoint_sink(nullptr);
         sampler.prepare(prompt);
         const int selected = sampler.enabled() ? sampler.pick(runtime, metrics) : anchor;
-        if (dspark_enabled) write_aux(aux_path, aux.values);
+        if (draft_request) write_aux(aux_path, aux.values);
         runtime.start_decode(&metrics);
         decode_started = true;
         position = int(prompt.size());
         pending = selected;
         active[size_t(slot)] = true;
+        snapshot.assign(prompt.begin(), prompt.end());
+        snapshot.push_back(selected);
         if (const char* profile = std::getenv("STRATA_MINICPM_PP_PROFILE");
             profile && std::string(profile) == "1") {
+            std::array<char, 129> pinned_error{};
+            const auto& pin_error = runtime.pinned_expert_error();
+            const size_t error_size = (std::min)(pin_error.size(), pinned_error.size() - 1);
+            for (size_t i = 0; i < error_size; ++i) {
+                const auto c = static_cast<unsigned char>(pin_error[i]);
+                const bool safe = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                                  (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.' || c == ':';
+                pinned_error[i] = safe ? static_cast<char>(c) : '_';
+            }
             std::fprintf(stderr,
                 "minicpm_pp_profile tokens=%zu batch=%d slots=%d cache_slots=%zu "
                 "dense_ms=%.3f route_ms=%.3f copy_ms=%.3f moe_ms=%.3f "
                 "expert_h2d=%llu expert_h2d_calls=%llu hits=%llu misses=%llu "
-                "expert_launches=%llu sync=%llu\n",
+                "expert_launches=%llu sync=%llu "
+                "gdn_ms=%.3f attention_ms=%.3f gu_ms=%.3f down_ms=%.3f shared_ms=%.3f "
+                "address_ms=%.3f pinned_layers=%zu pinned_bytes=%zu pinned_error=%s\n",
                 prompt.size(), chunk, runtime.session_capacity(), runtime.expert_cache_slots(),
                 metrics.pp_dense_event_ms, metrics.pp_route_event_ms,
                 metrics.pp_copy_event_ms, metrics.pp_moe_event_ms,
@@ -214,19 +366,27 @@ void request(Runtime& runtime, DsparkVerifyState& verify, const std::string& aux
                 static_cast<unsigned long long>(metrics.expert_cache_hits),
                 static_cast<unsigned long long>(metrics.expert_cache_misses),
                 static_cast<unsigned long long>(metrics.expert_launches),
-                static_cast<unsigned long long>(metrics.explicit_syncs));
+                static_cast<unsigned long long>(metrics.explicit_syncs),
+                metrics.pp_gdn_event_ms, metrics.pp_attention_event_ms,
+                metrics.pp_gu_event_ms, metrics.pp_down_event_ms, metrics.pp_shared_event_ms,
+                metrics.pp_address_ms, runtime.pinned_expert_layers(), runtime.pinned_expert_bytes(),
+                error_size ? pinned_error.data() : "none");
             std::fflush(stderr);
         }
-        std::printf("PREFILL anchor=%d tokens=%zu pp_ms=%.3f aux=%zu cache_slots=%zu\n",
+        std::printf("PREFILL anchor=%d tokens=%zu pp_ms=%.3f aux=%zu cache_slots=%zu pp_resume=%d\n",
                     selected, prompt.size(), elapsed_ms(started),
-                    aux.values.size() * sizeof(float), runtime.expert_cache_slots());
+                    aux.values.size() * sizeof(float), runtime.expert_cache_slots(), resume);
         std::fflush(stdout);
         return;
     }
     if (command == "RELEASE") {
+        trace.stop("release");
         if (input >> extra) throw std::invalid_argument("unexpected RELEASE field");
+        const bool keep = !snapshots[size_t(slot)].empty() && position > 0;
         if (decode_started) { runtime.finish_decode(); decode_started = false; }
-        runtime.select_session(slot); runtime.reset_session();
+        runtime.select_session(slot); runtime.reset_session(keep);
+        resumables[size_t(slot)] = keep;
+        if (!keep) snapshots[size_t(slot)].clear();
         position = pending = -1;
         active[size_t(slot)] = false;
         sampler = SlotSampling{};
@@ -242,16 +402,20 @@ void request(Runtime& runtime, DsparkVerifyState& verify, const std::string& aux
         Metrics metrics;
         const auto started = Clock::now();
         if (!decode_started) { runtime.start_decode(&metrics); decode_started = true; }
+        trace.before_step(slot);
         const int greedy = runtime.run_token(anchor, position, true, metrics);
         sampler.remember(anchor);
         const int next = sampler.enabled() ? sampler.pick(runtime, metrics) : greedy;
         ++position;
         pending = next;
-        std::printf("STEPPED next=%d ms=%.3f\n", next, elapsed_ms(started));
+        snapshots[size_t(slot)].push_back(next);
+        trace.after_step(slot);
+        print_native_step(next, elapsed_ms(started), metrics);
         std::fflush(stdout);
         return;
     }
     if (command == "VERIFY") {
+        trace.stop("verify");
         if (!dspark_enabled) throw std::invalid_argument("DSpark verification is disabled");
         if (sampler.enabled())
             throw std::invalid_argument("DSpark verification requires greedy sampling");
@@ -272,6 +436,8 @@ void request(Runtime& runtime, DsparkVerifyState& verify, const std::string& aux
         write_aux(aux_path, result.auxiliary);
         position += int(result.committed_ids.size());
         pending = result.next;
+        snapshots[size_t(slot)].insert(snapshots[size_t(slot)].end(),
+                                       result.committed_ids.begin(), result.committed_ids.end());
         std::printf("VERIFIED ids=");
         for (size_t i = 0; i < result.committed_ids.size(); ++i)
             std::printf("%s%d", i ? "," : "", result.committed_ids[i]);
@@ -293,6 +459,7 @@ static int minicpm_protocol(int argc, char** argv) {
         return 2;
     }
     try {
+        const bool trace_enabled = cuda_trace_ranges_enabled();
         const bool dspark_enabled = argc == 6 && std::string(argv[5]) == "1";
 #ifdef _WIN32
         _putenv_s("STRATA_QWEN35_SESSIONS", argv[4]);
@@ -300,23 +467,28 @@ static int minicpm_protocol(int argc, char** argv) {
         setenv("STRATA_QWEN35_SESSIONS", argv[4], 1);
 #endif
         Runtime runtime(argv[1], std::stoi(argv[2]), true);
+        CudaTraceRanges trace(trace_enabled);
         DsparkVerifyState verify;
         if (dspark_enabled) runtime.prepare_dspark_verify(verify);
         std::array<int, 2> positions{-1, -1}, pendings{-1, -1};
         std::array<bool, 2> active{false, false};
         std::array<SlotSampling, 2> sampling{};
+        std::array<std::vector<int>, 2> snapshots{};
+        std::array<bool, 2> resumables{false, false};
         bool decode_started = false;
         std::printf("READY slots=%d\n", runtime.session_capacity()); std::fflush(stdout);
         std::string line;
         while (std::getline(std::cin, line)) {
-            if (line == "QUIT") break;
+            if (line == "QUIT") { trace.stop("quit"); break; }
             try { request(runtime, verify, argv[3], line, positions, pendings, active, sampling,
-                          dspark_enabled, decode_started); }
+                          snapshots, resumables, dspark_enabled, decode_started, trace); }
             catch (const std::exception& error) {
+                trace.stop("exception");
                 std::fprintf(stderr, "DSpark request: %s\n", error.what());
                 std::printf("ERROR %s\n", error.what()); std::fflush(stdout);
             }
         }
+        trace.stop("eof");
         return 0;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "DSpark engine: %s\n", error.what());

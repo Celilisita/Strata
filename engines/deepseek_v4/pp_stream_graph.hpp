@@ -32,5 +32,5 @@ inline PpStreamSources pp_stream_sources(const ggml_tensor* t) {
 ggml_tensor* build_pp_stream(ggml_context*, ggml_tensor* x, ggml_tensor* ids, ggml_tensor* weights,
                             ggml_tensor* gate, ggml_tensor* up, ggml_tensor* down, float clamp,
                             int window_experts = 32, const PpCacheView* cache = nullptr);
-bool pp_stream_enabled();
+bool pp_stream_enabled(bool glm = false);
 }

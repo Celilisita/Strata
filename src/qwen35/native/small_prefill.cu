@@ -184,7 +184,8 @@ void small_prefill_q4_masked_linear(Matrix weight,const void *input,float *outpu
 }
 void small_prefill_linear(Matrix weight,const void *input,float *output,int tokens,cudaStream_t stream,int processors){
     matrix_bytes(weight);
-    if(tokens<2||tokens>=64)throw std::invalid_argument("small PP projection shape");
+    if((weight.quant!=Quant::Q4K&&weight.quant!=Quant::Q6K)||tokens<2||tokens>=64)
+        throw std::invalid_argument("small PP projection requires Q4_K/Q6_K");
     if(processors<=0)throw std::invalid_argument("small PP rounding policy processors");
     const int tiles=(weight.rows+127)/128;
     const int waves=(tiles+processors-1)/processors;

@@ -1,6 +1,10 @@
 #include "strata/qwen35/native/tiny_batch.hpp"
+#include "tiny_parameter_pair.hpp"
+#include "tiny_parameter_pair_policy.hpp"
 #include "vector_fragment.cuh"
 #include "math.cuh"
+#include <cstdint>
+#include <limits>
 namespace strata::qwen35::native {
 namespace {
 using detail::ActivationBlock;
@@ -14,8 +18,10 @@ __global__ void encode(const float *x,ActivationBlock *out,int columns){
     auto &b=out[size_t(blockIdx.y)*(columns/32)+group];b.codes[lane]=static_cast<signed char>(code);
     if(!lane)b.delta=__float2half_rn(delta);
 }
-template<Quant Type,bool Pair,int Tokens,int Parts,bool Packed>
+template<Quant Type,bool Pair,int Tokens,int Parts,bool Packed,bool TwoJobs=false>
 __global__ void multiply(Matrix a,Matrix b,const ActivationBlock *input,float *first,float *second,float *activation){
+    if constexpr(TwoJobs){static_assert(!Pair,"independent paired jobs cannot use the SwiGLU epilogue");
+        if(blockIdx.y){a=b;first=second;}}
     constexpr int Logical=128,Extra=Parts==2?1:0,Workers=Type==Quant::Q4K?16:32;
     constexpr int Bytes=Type==Quant::Q4K?144:210;
     __shared__ float partial[Tokens][Pair?2:1][Logical];
@@ -59,24 +65,55 @@ template<bool Pair,int Tokens> void launch(Matrix a,Matrix b,const void *input,f
 }
 void validate(Matrix m,const void *x,const float *out,int tokens){
     matrix_bytes(m);
-    if(!x||!out||(tokens!=2&&tokens!=3)||(m.layout!=BlockLayout::Gguf&&m.layout!=BlockLayout::Q4Pairs))
+    if((m.quant!=Quant::Q4K&&m.quant!=Quant::Q6K)||!x||!out||(tokens<2||tokens>4)||(m.layout!=BlockLayout::Gguf&&m.layout!=BlockLayout::Q4Pairs))
         throw std::invalid_argument("invalid own tiny-batch matrix lease");
+}
+bool parameter_pair_overlap(const void *a,size_t n,const void *b,size_t m){
+    const auto x=reinterpret_cast<uintptr_t>(a),y=reinterpret_cast<uintptr_t>(b);
+    if(n>std::numeric_limits<uintptr_t>::max()-x||m>std::numeric_limits<uintptr_t>::max()-y)
+        throw std::invalid_argument("tiny parameter pair extent overflow");
+    return x<y+m&&y<x+n;
 }
 }
 void tiny_batch_quantize(const float *x,void *out,int columns,int tokens,cudaStream_t s){
-    if(!x||!out||columns<256||columns%256||(tokens!=2&&tokens!=3))throw std::invalid_argument("invalid tiny activation span");
+    if(!x||!out||columns<256||columns%256||(tokens<2||tokens>4))throw std::invalid_argument("invalid tiny activation span");
     encode<<<dim3((columns/32+3)/4,tokens),128,0,s>>>(x,static_cast<ActivationBlock *>(out),columns);
     check_cuda(cudaGetLastError(),"own tiny batch quantization");
 }
 void tiny_batch_linear(Matrix m,const void *x,float *out,int tokens,cudaStream_t s){
     validate(m,x,out,tokens);
-    if(tokens==2)launch<false,2>(m,m,x,out,nullptr,nullptr,s);else launch<false,3>(m,m,x,out,nullptr,nullptr,s);
+    if(tokens==2)launch<false,2>(m,m,x,out,nullptr,nullptr,s);else if(tokens==3)launch<false,3>(m,m,x,out,nullptr,nullptr,s);else launch<false,4>(m,m,x,out,nullptr,nullptr,s);
     check_cuda(cudaGetLastError(),"own tiny batch projection");
 }
 void tiny_batch_pair(Matrix a,Matrix b,const void *x,float *first,float *second,float *act,int tokens,cudaStream_t s){
     validate(a,x,first,tokens);validate(b,x,second,tokens);
     if(!act||a.quant!=b.quant||a.layout!=b.layout||a.rows!=b.rows||a.columns!=b.columns)throw std::invalid_argument("invalid tiny pair");
-    if(tokens==2)launch<true,2>(a,b,x,first,second,act,s);else launch<true,3>(a,b,x,first,second,act,s);
+    if(tokens==2)launch<true,2>(a,b,x,first,second,act,s);else if(tokens==3)launch<true,3>(a,b,x,first,second,act,s);else launch<true,4>(a,b,x,first,second,act,s);
     check_cuda(cudaGetLastError(),"own tiny batch fused pair");
+}
+TinyParameterPairResources tiny_batch_parameter_pair_resources(){
+    cudaFuncAttributes a{};int blocks=0;
+    check_cuda(cudaFuncGetAttributes(&a,multiply<Quant::Q4K,false,3,2,true,true>),"tiny parameter pair attributes");
+    check_cuda(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks,multiply<Quant::Q4K,false,3,2,true,true>,64,0),"tiny parameter pair occupancy");
+    return {a.numRegs,blocks,a.sharedSizeBytes,a.localSizeBytes};
+}
+void tiny_batch_parameter_pair(Matrix a,Matrix b,const void *input,float *first,float *second,int tokens,cudaStream_t stream){
+    const size_t ab=matrix_bytes(a),bb=matrix_bytes(b);
+    if(!input||!first||!second||tokens!=3||a.quant!=Quant::Q4K||b.quant!=Quant::Q4K||
+       a.layout!=BlockLayout::Q4Pairs||b.layout!=BlockLayout::Q4Pairs||
+       a.rows!=48||b.rows!=48||a.columns!=5120||b.columns!=5120||
+       reinterpret_cast<uintptr_t>(a.data)%4||reinterpret_cast<uintptr_t>(b.data)%4||
+       reinterpret_cast<uintptr_t>(input)%alignof(ActivationBlock)||
+       reinterpret_cast<uintptr_t>(first)%alignof(float)||reinterpret_cast<uintptr_t>(second)%alignof(float))
+        throw std::invalid_argument("tiny parameter pair T3 actual geometry/alignment");
+    const size_t encoded=size_t(tokens)*a.columns/32*sizeof(ActivationBlock),out=size_t(tokens)*a.rows*sizeof(float);
+    if(parameter_pair_overlap(input,encoded,first,out)||parameter_pair_overlap(input,encoded,second,out)||parameter_pair_overlap(first,out,second,out)||
+       parameter_pair_overlap(a.data,ab,first,out)||parameter_pair_overlap(a.data,ab,second,out)||parameter_pair_overlap(b.data,bb,first,out)||parameter_pair_overlap(b.data,bb,second,out)||
+       parameter_pair_overlap(a.data,ab,input,encoded)||parameter_pair_overlap(b.data,bb,input,encoded))
+        throw std::invalid_argument("tiny parameter pair operand/output aliases");
+    multiply<Quant::Q4K,false,3,2,true,true><<<dim3(48,2),64,0,stream>>>(a,b,
+        static_cast<const ActivationBlock *>(input),first,second,nullptr);
+    check_cuda(cudaGetLastError(),"tiny parameter pair joint grid projection");
+    ++tiny_parameter_pair_request().submissions;
 }
 }

@@ -7,7 +7,7 @@
 
 namespace strata::models {
 
-enum class Family { qwen4exp, deepseek4, qwen35_dense, qwen35_moe };
+enum class Family { qwen4exp, deepseek4, qwen35_dense, qwen35_moe, glm5_next };
 
 struct ModelIdentity {
     Family family;
@@ -34,6 +34,9 @@ inline bool identify(const GgufFile& gguf, ModelIdentity& out, std::string& erro
     } else if (architecture->s == "deepseek4") {
         out.family = Family::deepseek4;
         prefix = "deepseek4.";
+    } else if (architecture->s == "glm5-next" || architecture->s == "glm5next") {
+        out.family = Family::glm5_next;
+        prefix = architecture->s + ".";
     } else if (architecture->s == "qwen35") {
         out.family = Family::qwen35_dense;
         prefix = "qwen35.";
@@ -69,6 +72,7 @@ inline const char* family_name(Family family) {
     case Family::deepseek4: return "deepseek4";
     case Family::qwen35_dense: return "qwen35_dense";
     case Family::qwen35_moe: return "qwen35_moe";
+    case Family::glm5_next: return "glm5_next";
     }
     return "unsupported";
 }

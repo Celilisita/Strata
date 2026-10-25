@@ -1,18 +1,15 @@
 #include "strata/qwen35moe/runtime.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/native_qsa.hpp"
+#include "runtime_prefix_demand.hpp"
 
 namespace strata::qwen35moe {
-// One model layer executor for prefill and speculative verification. Placement
-// and token count change the schedule, never the layer's arithmetic or weights.
-void Runtime::decode_batch_layer(size_t il, int count, int first_position,
-                                  const std::string& reference, Metrics& metrics) {
+void Runtime::batch_dense_layer(size_t il, int count, int first_position,
+                                const std::string& reference) {
     auto& b = batch_; auto& layer = layers_[il];
     if (paired_session_) paired_layer_ = il;
-    dense_profile_.begin(prefill_event_offset_ + il, !decode_phase_, stream_);
+    dense_profile_.begin(prefill_event_offset_ + il, !decode_phase_ && count >= 1024, stream_);
     const bool probe = il == 0 && !reference.empty();
-    if (dense_profile_.active() && (probe || paired_session_))
-        throw std::invalid_argument("dense profile requires ordinary real prefill");
     kernels::native_qsa_rms_norm_weighted(b.hidden.as<float>(), layer.attn_norm.f32(),
         b.norm.as<float>(), 2048, count, float(spec_.rms_epsilon), stream_);
     dense_profile_.launches(1);
@@ -35,8 +32,25 @@ void Runtime::decode_batch_layer(size_t il, int count, int first_position,
     if (probe) batch_probe_.post_norm = batch_stage_error(reference, "attn_post_norm-0", b.norm.as<float>(), 2048);
     dense_profile_.launches(2);
     dense_profile_.mark(DenseStage::Residual, stream_);
+}
+// One model layer executor for prefill and speculative verification. Placement
+// and token count change the schedule, never the layer's arithmetic or weights.
+void Runtime::decode_batch_layer(size_t il, int count, int first_position,
+                                  const std::string& reference, Metrics& metrics) {
+    auto& b = batch_; auto& layer = layers_[il];
+    if (paired_session_) paired_layer_ = il;
+    dense_profile_.begin(prefill_event_offset_ + il, !decode_phase_, stream_);
+    const bool probe = il == 0 && !reference.empty();
+    if (dense_profile_.active() && (probe || paired_session_))
+        throw std::invalid_argument("dense profile requires ordinary real prefill");
+    const auto prefix_ids=batch_prefix_dense(il,count,first_position,reference,metrics);
+    if(prefix_ids.empty())batch_dense_layer(il,count,first_position,reference);
     if (!prefill_events_.empty() && !decode_phase_)
         cuda_check(cudaEventRecord(prefill_events_[prefill_event_offset_ + il][1], stream_), "prefill MoE begin");
+    // Queue the entire tail first: pageable source staging cannot delay its submission.
+    if(!prefix_ids.empty())prefetch_prefix(il,prefix_ids,metrics);
+    // Both previous MoE and this dense work are queued before pageable staging.
+    prefetch_layer(il, count, probe ? reference : std::string(), metrics);
     batch_moe(il, layer, count, probe ? reference : std::string(), metrics);
     if (probe) {
         batch_probe_.logits = batch_stage_error(reference, "ffn_moe_logits-0", b.logits.as<float>(), 256);

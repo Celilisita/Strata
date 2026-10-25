@@ -17,12 +17,13 @@ void AttentionLayer::cache_only(const float *hidden,const int *positions,Attenti
     const auto &scratch=shared_.shared_ffn(tokens).buffers();
     void *prepared=tokens==1?scratch.quant_input:scratch.half_input;
     rms_norm(hidden,w.norm,b.norm,s.hidden,tokens,s.epsilon,stream);
-    if(tokens==1)vector_quantize(b.norm,prepared,s.hidden,stream);
+    if(w.k.quant==Quant::NVFP4&&w.v.quant==Quant::NVFP4){}
+    else if(tokens==1)vector_quantize(b.norm,prepared,s.hidden,stream);
     else if(shared_.tiny_batches(tokens))tiny_batch_quantize(b.norm,prepared,s.hidden,tokens,stream);
     else if(tokens<64)small_prefill_quantize(b.norm,prepared,s.hidden,tokens,stream);
     else to_half(b.norm,prepared,size_t(s.hidden)*tokens,stream);
-    shared_.project(w.k,prepared,b.k_raw,tokens,schedule_.projections[1],stream);
-    shared_.project(w.v,prepared,b.v_raw,tokens,schedule_.projections[2],stream);
+    shared_.project(w.k,w.k.quant==Quant::NVFP4?b.norm:prepared,b.k_raw,tokens,schedule_.projections[1],stream);
+    shared_.project(w.v,w.v.quant==Quant::NVFP4?b.norm:prepared,b.v_raw,tokens,schedule_.projections[2],stream);
     rms_norm(b.k_raw,w.k_norm,b.k_norm,s.dim,tokens*s.kv_heads,s.epsilon,stream);
     if(visual_positions_)rotary_visual(b.k_norm,positions,b.k_rope,s.dim,s.rotary_dim,s.kv_heads,tokens,s.rotary_base,stream,visual_positions_);
     else rotary_text(b.k_norm,positions,b.k_rope,s.dim,s.rotary_dim,s.kv_heads,tokens,s.rotary_base,stream);

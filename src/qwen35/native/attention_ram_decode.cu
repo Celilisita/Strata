@@ -154,7 +154,7 @@ DecodeNode ram_decode_node(void *function){
 void ram_attention(const float *q,RamKvView ram,float *out,void *work,size_t bytes,const int *positions,
                    int shift,int tokens,int heads,DecodeRounding rounding,cudaStream_t stream){
     const int maximum=decode_partition_count(ram.selected_tokens,heads,rounding);
-    if(!q||!out||!work||!positions||tokens<1||tokens>3||bytes<size_t(heads)*maximum*258*4)
+    if(!q||!out||!work||!positions||tokens<1||tokens>4||bytes<size_t(heads)*maximum*258*4)
         throw std::invalid_argument("invalid RAM selected decode workspace");
     for(int token=0;token<tokens;++token){
         const float *query=q+size_t(token)*heads*256;float *output=out+size_t(token)*heads*256;

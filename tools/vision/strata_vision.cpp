@@ -16,6 +16,10 @@
 #include "ggml-cpu.h"
 #include "gguf.h"
 #include "llama.h"
+#ifdef STRATA_GLM5_NEXT_SPLITS
+#include "../../engines/glm5_next/split_loader.hpp"
+#include "../../engines/glm5_next/cpu_placement.hpp"
+#endif
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
@@ -25,6 +29,7 @@
 #include <unistd.h>
 #endif
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -55,6 +60,10 @@ bool parse_enc(const std::string& line, std::string& img, std::string& out) {
 }  // namespace
 
 int main(int argc, char** argv) {
+#ifdef STRATA_GLM5_NEXT_SPLITS
+    try { strata::glm5_next::configure_cpu_process(); }
+    catch (const std::exception& error) { std::fprintf(stderr, "%s\n", error.what()); return 2; }
+#endif
     std::string mmproj, model;
     bool gpu = false;
     int threads = 0, max_tokens = 0, min_tokens = 0;
@@ -114,7 +123,11 @@ int main(int argc, char** argv) {
 #endif
     llama_model_params mp = llama_model_default_params();
     mp.vocab_only = true;
+#ifdef STRATA_GLM5_NEXT_SPLITS
+    llama_model* text = strata::glm5_next::load(model, mp);
+#else
     llama_model* text = llama_model_load_from_file(model.c_str(), mp);
+#endif
     if (!text) { std::printf("ERR cannot open the text model %s\n", model.c_str()); std::fflush(stdout); return 1; }
 
     mtmd_context_params cp = mtmd_context_params_default();
@@ -143,7 +156,7 @@ int main(int argc, char** argv) {
                  std::chrono::duration<double>(std::chrono::steady_clock::now() - load_t0).count());
     // a vocab-only model reports no hparams, so the width comes from the projector: its output is the model's input
     int n_embd = 0;
-    bool deepseek4v = false;
+    bool deepseek4v = false, glm5v = false;
     {
         gguf_init_params gp{true, nullptr};
         gguf_context* gg = gguf_init_from_file(mmproj.c_str(), gp);
@@ -152,7 +165,8 @@ int main(int argc, char** argv) {
         int64_t type = gg ? gguf_find_key(gg, "clip.projector_type") : -1;
         if (type < 0 && gg) type = gguf_find_key(gg, "clip.vision.projector_type");
         if (type >= 0 && gguf_get_kv_type(gg, type) == GGUF_TYPE_STRING)
-            deepseek4v = std::strcmp(gguf_get_val_str(gg, type), "deepseek4v") == 0;
+            { deepseek4v = std::strcmp(gguf_get_val_str(gg, type), "deepseek4v") == 0;
+              glm5v = std::strcmp(gguf_get_val_str(gg, type), "glm5v") == 0; }
         if (gg) gguf_free(gg);
     }
     if (n_embd <= 0) { std::printf("ERR the vision encoder has no projection_dim\n"); std::fflush(stdout); return 1; }
@@ -173,17 +187,30 @@ int main(int argc, char** argv) {
         mtmd_input_text txt{marker.c_str(), marker.size(), false, true};
         const mtmd_bitmap* bms[1] = {bm};
         int warm_tokens = 0;
-        if (bm && mtmd_tokenize(ctx, chunks, &txt, bms, 1) == 0) {
+        bool warm_ok = bm && chunks && mtmd_tokenize(ctx, chunks, &txt, bms, 1) == 0;
+        if (warm_ok) {
             for (size_t c = 0; c < mtmd_input_chunks_size(chunks); ++c) {
                 const mtmd_input_chunk* ch = mtmd_input_chunks_get(chunks, c);
-                if (mtmd_input_chunk_get_type(ch) == MTMD_INPUT_CHUNK_TYPE_IMAGE && mtmd_encode_chunk(ctx, ch) == 0)
-                    warm_tokens = (int) mtmd_input_chunk_get_n_tokens(ch);
+                if (mtmd_input_chunk_get_type(ch) != MTMD_INPUT_CHUNK_TYPE_IMAGE) continue;
+                if (mtmd_encode_chunk(ctx, ch) != 0) { warm_ok = false; break; }
+                warm_tokens = (int) mtmd_input_chunk_get_n_tokens(ch);
+                if (warm_tokens <= 0 || !mtmd_get_output_embd(ctx)) { warm_ok = false; break; }
             }
         }
         std::fprintf(stderr, "strata-vision: warmed up at %d image tokens in %.1f s\n", warm_tokens,
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - warm_t0).count());
         mtmd_input_chunks_free(chunks);
         if (bm) mtmd_bitmap_free(bm);
+        // READY promises that the GPU workspace was reserved before the main
+        // model starts. Failed warm-up must not defer that allocation to ENC.
+        if (!warm_ok || warm_tokens <= 0) {
+            std::printf("ERR GPU vision workspace warm-up failed\n");
+            std::fflush(stdout);
+            mtmd_free(ctx);
+            llama_model_free(text);
+            llama_backend_free();
+            return 1;
+        }
     }
     std::printf("READY %d\n", n_embd);
     std::fflush(stdout);
@@ -214,16 +241,20 @@ int main(int argc, char** argv) {
         if (err.empty()) {
             const mtmd_image_tokens* it = mtmd_input_chunk_get_tokens_image(ichunk);
             const int n = (int) mtmd_input_chunk_get_n_tokens(ichunk);
+            const float* embd = mtmd_get_output_embd(ctx);
+            if (n <= 0 || !embd) err = "the vision encoder returned no embeddings";
+            else if (!std::all_of(embd, embd + size_t(n) * size_t(n_embd),
+                                 [](float value) { return std::isfinite(value); }))
+                err = "the vision encoder returned non-finite embeddings";
             // DeepSeek4V emits one complete LLM block with learned PAD/START/END
             // and newline rows; it is a sequence, not Qwen's rectangular grid.
             int nx = n, ny = 1;
-            if (!deepseek4v) {
+            if (err.empty() && !deepseek4v && !glm5v) {
                 const mtmd_decoder_pos last = mtmd_image_tokens_get_decoder_pos(it, 0, (size_t) n - 1);
                 nx = (int) last.x + 1;
                 ny = (int) last.y + 1;
                 if (nx * ny != n) err = "the image grid is not rectangular (" + std::to_string(n) + " tokens)";
             }
-            const float* embd = mtmd_get_output_embd(ctx);
             FILE* f = err.empty() ? std::fopen(out.c_str(), "wb") : nullptr;
             if (err.empty() && !f) err = "cannot write " + out;
             if (f) {

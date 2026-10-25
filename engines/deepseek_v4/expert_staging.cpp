@@ -106,18 +106,20 @@ void ExpertStaging::register_sources(const std::vector<ggml_tensor*>& sources, u
     if (source_pin_ || metrics_.calls)
         throw std::runtime_error("expert source pinning must precede the first upload");
     if (!budget) return;
+    // Reserve the PP control events/stream before the large source registration.
+    // No transport reads are submitted until initialization returns.
+    if (pp_stream_enabled() || pp_stream_enabled(true)) {
+        bind_pp_transport(backend_, [](const void* p, size_t n, void* owner) {
+            return static_cast<ExpertStaging*>(owner)->transport_segment(p, n);
+        }, this);
+        pp_transport_bound_ = true;
+    }
     if (retained && *retained) {
         if (!(*retained)->matches(backend_, sources, budget)) throw std::runtime_error("retained source registration identity differs");
         source_pin_ = *retained;
     } else {
         source_pin_ = std::make_shared<ExpertSourcePin>(backend_, sources, budget);
         if (retained) *retained = source_pin_;
-    }
-    if (pp_stream_enabled()) {
-        bind_pp_transport(backend_, [](const void* p, size_t n, void* owner) {
-            return static_cast<ExpertStaging*>(owner)->transport_segment(p, n);
-        }, this);
-        pp_transport_bound_ = true;
     }
 }
 
@@ -179,6 +181,7 @@ void ExpertStaging::upload(ggml_backend_t backend, ggml_tensor* destination,
         const std::size_t size = std::min(slab_bytes, segment.bytes);
         const auto copy_start = StagingClock::now();
         std::memcpy(slab.data, input + consumed, size);
+        metrics_.host_copy_bytes += size;
         const auto copy_end = StagingClock::now();
         add_wall_time(metrics_.host_copy_wall_ns, copy_start, copy_end);
         // Canonical set_async uses this backend's existing compute stream.

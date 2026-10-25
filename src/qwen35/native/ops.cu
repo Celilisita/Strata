@@ -14,26 +14,7 @@ __device__ float sum_warp(float value) {
 }
 #include "ops_fused.cuh"
 #include "ops_pack32.cuh"
-__global__ void rms(const float *x, const float *w, float *out, const float *gate, int features, float epsilon, int stride) {
-    __shared__ float partial[32];
-    const size_t base = size_t(blockIdx.x) * features;
-    const size_t source = size_t(blockIdx.x) * stride;
-    float square = 0;
-    for (int i = threadIdx.x; i < features; i += blockDim.x) {
-        const float value = x[source + i];
-        square = __fmaf_rn(value, value, square);
-    }
-    square = sum_warp(square);
-    if (threadIdx.x % 32 == 0) partial[threadIdx.x / 32] = square;
-    __syncthreads();
-    square = sum_warp(threadIdx.x % 32 < blockDim.x / 32 ? partial[threadIdx.x % 32] : 0.0f);
-    const float scale = rsqrtf(__fmaf_rn(square, __fdividef(1.0f, float(features)), epsilon));
-    for (int i = threadIdx.x; i < features; i += blockDim.x) {
-        float value = __fmul_rn(__fmul_rn(x[source + i], scale), w[i]);
-        if (gate) value = __fmul_rn(value, swiglu_value(gate[base + i], 1.0f));
-        out[base + i] = value;
-    }
-}
+
 __global__ void convolution(const float *x, const float *history, const float *w, float *raw,
                             float *activated, float *next, int channels, int tokens) {
     const size_t index = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -83,10 +64,7 @@ __global__ void parameters(const float *alpha, const float *br, const float *bia
     g[i] = __fmul_rn(softplus, a[i % heads]);
     beta[i] = __fdividef(1.0f, __fadd_rn(1.0f, __expf(-br[i])));
 }
-__global__ void residual(const float *a, const float *b, float *out, size_t count) {
-    const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i < count) out[i] = __fadd_rn(a[i], b[i]);
-}
+
 }
 void rms_norm_quantized32(const float *x,const float *w,float *out,const float *gate,
                          int features,int heads,float eps,void *q4,void *q6,cudaStream_t stream){
@@ -111,15 +89,7 @@ void rms_norm_quantized32(const float *x,const float *w,float *out,const float *
         static_cast<detail::HalfAffineInputBlock *>(q4),static_cast<detail::HalfInputBlock *>(q6),features,heads,eps);
     check_cuda(cudaGetLastError(),"owned fused RMS joint Q4/Q6 preparation");
 }
-void rms_norm(const float *x, const float *w, float *out, int features, int rows, float eps,
-              cudaStream_t stream, const float *gate, int input_stride) {
-    if (!input_stride) input_stride = features;
-    if (!x || !w || !out || features < 32 || features > 32768 || rows < 1 || rows > 2097152 || !(eps > 0) || !std::isfinite(eps))
-        throw std::invalid_argument("invalid own RMS normalization");
-    if (input_stride < features || (gate && input_stride != features)) throw std::invalid_argument("invalid own RMS row stride");
-    rms<<<rows, features >= 1024 ? 1024 : 256, 0, stream>>>(x, w, out, gate, features, eps, input_stride);
-    check_cuda(cudaGetLastError(), "native RMS normalization");
-}
+
 void causal_conv4(const float *x, const float *history, const float *w, float *raw, float *activated,
                   float *next, int channels, int tokens, cudaStream_t stream) {
     if (!x || !history || !w || !raw || !activated || !next || history == next || channels < 1 || tokens < 1 || tokens > 8192)
@@ -148,11 +118,7 @@ void gdn_parameters(const float *alpha, const float *br, const float *bias, cons
     parameters<<<unsigned((count + 255) / 256), 256, 0, stream>>>(alpha, br, bias, a, g, beta, heads, count);
     check_cuda(cudaGetLastError(), "native GDN decay/beta");
 }
-void add(const float *a, const float *b, float *out, size_t count, cudaStream_t stream) {
-    if (!a || !b || !out || !count) throw std::invalid_argument("invalid own residual addition");
-    residual<<<unsigned((count + 255) / 256), 256, 0, stream>>>(a, b, out, count);
-    check_cuda(cudaGetLastError(), "native residual addition");
-}
+
 void add_rms_norm(const float *a,const float *b,const float *w,float *residual_out,float *out,
                   int features,int rows,float eps,cudaStream_t stream) {
     if(!a||!b||!w||!residual_out||!out||a==residual_out||b==residual_out||residual_out==out||

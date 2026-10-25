@@ -1,5 +1,6 @@
 #pragma once
 #include "strata/kernels/gdn.hpp"
+#include <cstddef>
 
 namespace strata::kernels {
 
@@ -25,4 +26,23 @@ void native_gdn_scan(float* state, const float* q, const float* k, const float* 
                      const float* gate, const float* beta, float* output,
                      const GdnShapes& shapes, int tokens, int input_stride, void* stream, float* first_token_state = nullptr, int column_tile = 1);
 
+// Opt-in ordinary PP algebra: metadata plus one persistent two-token scan.
+// No allocation/synchronization. Metadata uses ceil(T/2)*h_v*32 bytes; caller
+// supplies dead phase scratch disjoint from every live input/state/output.
+bool native_gdn_pair2_enabled();
+size_t native_gdn_pair2_workspace(const GdnShapes& shape,int tokens);
+void native_gdn_scan_pair2(float* state,const float* q,const float* k,const float* v,
+    const float* gate,const float* beta,float* output,const GdnShapes& shape,int tokens,
+    int input_stride,void* scratch,size_t scratch_bytes,void* stream);
+
+// Four-token variant: ceil(T/4)*h_v*96 bytes, same lifetime contract.
+bool native_gdn_chunk4_enabled();
+size_t native_gdn_chunk4_workspace(const GdnShapes& shape,int tokens);
+void native_gdn_scan_chunk4(float* state,const float* q,const float* k,const float* v,
+    const float* gate,const float* beta,float* output,const GdnShapes& shape,int tokens,
+    int input_stride,void* scratch,size_t scratch_bytes,void* stream);
+
+// Ordinary PP explicit alpha input; legacy APIs continue accepting log gate.
+void native_gdn_scan_alpha(float* state,const float* q,const float* k,const float* v,
+    const float* alpha,const float* beta,float* output,const GdnShapes& shape,int tokens,int input_stride,void* stream);
 } // namespace strata::kernels

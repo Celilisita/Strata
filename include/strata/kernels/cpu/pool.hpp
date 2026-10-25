@@ -64,6 +64,8 @@ struct ExpertJobMulti {
     const uint8_t* gate = nullptr;
     const uint8_t* up = nullptr;
     const uint8_t* down = nullptr;
+    // Bound to this expert payload; applied before SwiGLU and after Down.
+    float gate_scale = 1.f, up_scale = 1.f, down_scale = 1.f;
 };
 
 /// How worker threads are allocated across physical/logical CPU cores (#272).  `All` is the layout the pool has

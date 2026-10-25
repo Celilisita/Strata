@@ -36,6 +36,11 @@ public:
     /// shape (so the caller falls back to bf16(), with the same ldx).
     bool bf16_hcd_exact(const uint16_t* X, int64_t ldx, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K);
 
+    /// Fixed PP router: original F32 X[T,2048] and W[257,2048], F32 Y[T,257].
+    /// False without mutation outside T1024..8192 or incompatible handle policy.
+    /// Uses the existing handle/stream/workspace; no mirror or new allocation.
+    bool router_f32(const float* X, const float* W, float* Y, int tokens);
+
     /// Y = X . W^T with both in FP16 (bits).
     void f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0,
              float beta = 0.0f);

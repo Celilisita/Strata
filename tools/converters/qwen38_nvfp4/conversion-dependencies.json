@@ -1,0 +1,148 @@
+{
+  "scope": "Minimal converter dependencies and preservation constraints; no installation/build executed.",
+  "CPU": [
+    "64-bit Python with NumPy",
+    "GGUF v3 reader with type40 NVFP4(64 elements,36 bytes)",
+    "quantize_nvfp4.py preserving source Q4_K/Q6_K decode, E4M3 SF and E2M1 law"
+  ],
+  "GPU": [
+    "64-bit Windows, NVIDIA SM120 device",
+    "CUDA toolkit with cuda_fp4.h/cuda_fp8.h (historically tested CUDA13.0)",
+    "MSVC x64 v14.38 runtime/toolchain for the converter DLL",
+    "gpu_conversion.py ctypes ABI plus convert_gpu.dll explicitly built from corresponding convert_gpu.cu",
+    "Strata codec.cuh plus strata/qwen35/native/quant.hpp include; CUDA fp16/fp4/fp8 runtime headers",
+    "CUDA shared runtime DLL visible on process PATH; no dependency on a running model or native-service process"
+  ],
+  "GPU_ABI": {
+    "exports": [
+      "sfp4_error",
+      "sfp4_convert"
+    ],
+    "types": [
+      12,
+      14
+    ],
+    "count_multiple": 256,
+    "maximum_elements_per_tensor": 200000000,
+    "minimum_free_reserve_bytes": 4294967296,
+    "allocation_scope": "One tensor at a time; original+F32decode+packedoutput+smallstats allocations freed at function exit."
+  },
+  "GPU_compile_recipe_historical": "nvcc -std=c++17 -O3 -arch=sm_120 --shared --cudart=shared -Xcompiler=/MD,/EHsc,/utf-8,/DNOMINMAX -Xptxas=-v -I<Strata/include> -I<codec-directory> convert_gpu.cu -o convert_gpu.dll",
+  "compile_status": "Documentation only. New parameterized entry must not compile, load models, infer, or run probes automatically.",
+  "frozen_algorithm_files": {
+    "quantize_nvfp4.py": {
+      "path": "work/27b-perf/native-fp4/quantize_nvfp4.py",
+      "bytes": 4182,
+      "sha256": "ff231695865b54847d5d3a6920798053bdd110b2e7e24d854f10d82057512c80"
+    },
+    "convert_gpu.cu": {
+      "path": "work/27b-perf/native-fp4/convert_gpu.cu",
+      "bytes": 7325,
+      "sha256": "d64d67f81b47a1ca9e324ef2f13d7155deca1fae1c4be0fdd35c9b1e55fca754"
+    },
+    "gpu_conversion.py": {
+      "path": "work/27b-perf/native-fp4/gpu_conversion.py",
+      "bytes": 1939,
+      "sha256": "3130077314bb7fb4d028ae45adf5c1da7628b3d594bf510e5585959fc8796e4e"
+    },
+    "head_fp4_gguf_reader.py": {
+      "path": "work/27b-perf/native-fp4/head_fp4_gguf_reader.py",
+      "bytes": 6143,
+      "sha256": "5ecf739bb3c2f07bc7f889f7f3a455e3dfdb40068409e10781a1a9b2be289b5e"
+    }
+  },
+  "codec_reference_warning": "Frozen conversion driver signature covers convert_gpu.cu+codec.cuh but does not record a complete SDK/transitive-header closure in its compact local receipt. New tools should record codec+quant+CUDA versions/DLL SHA; do not claim local vision-source reference equals the exact historical remote codec without a hash certificate.",
+  "runtime_compatibility": "The current223 cold_head_binding intentionally pins the known main/head provenance and geometry. A new generic conversion is not automatically a qualified current223 asset; never forge known SHA metadata to bypass this check.",
+  "lifetime_and_publication": [
+    "All taskTEMP/TMP/cache/partial/chunk/status files in Y:\\temp or a task child.",
+    "L:\\models is the durable publication destination; do not use it for temporary .partial files.",
+    "Create new outputs exclusively; never silently overwrite.",
+    "Read/validate source; write bounded temporary file; fsync; validate GGUF directory and tensor extents; compute whole output SHA; publish and receipt only after success.",
+    "A cross-volume Y-to-L copy is not an atomic rename; verify final bytes/hash and retain recoverable source until publication succeeds."
+  ],
+  "historical_script_limitations": [
+    "convert_original.py hardcodes source/output paths and source size+mtime; not a portable CLI. Existing-output reuse checks receipt/size but does not rehash whole file.",
+    "head_fp4_convert.py hardcodes the original-derived input identity, output subdirectory and full source stat; useful frozen provenance, not the new general entry.",
+    "run_conversion_batch.py builds a DLL and invokes old fixture gates. It is historical evidence and must not be invoked for file-only cleanup."
+  ],
+  "minimal_tool_improvements": [
+    "Implemented: explicit --source/--output/--head-output/--work-dir/--backend; both main and independent head are always produced, no selection switch and no hardcoded model mtime.",
+    "Implemented: optional explicit prebuilt --gpu-library; no implicit compilation or model/inference execution. There are no inspect/verify-only subcommands in this CLI.",
+    "Implemented: full input/output SHA and implementation identity, tensor selection receipt, bounded buffers, exclusive publication, and refused incomplete target/receipt pairs.",
+    "Preserved: original three-neighbor SF mathematics and exact untouched tensor copy; new independent head uses two CPU passes. A future search/format change needs a separate versioned artifact."
+  ],
+  "static_peer_review": {
+    "passed": true,
+    "reviewed_sources": [
+      {
+        "path": "conversion_io.py",
+        "bytes": 9384,
+        "sha256": "85d97f93370a0d94f3d8f058ed971cf71ed439c3054a0088d5b4454977d3ed05"
+      },
+      {
+        "path": "convert_q4_k_m_to_nvfp4.py",
+        "bytes": 3742,
+        "sha256": "deabb2c2c9b92a429605ebe133a67fd934d6a34182efba6af491b2bfc7a853aa"
+      },
+      {
+        "path": "gguf_reader.py",
+        "bytes": 6143,
+        "sha256": "5ecf739bb3c2f07bc7f889f7f3a455e3dfdb40068409e10781a1a9b2be289b5e"
+      },
+      {
+        "path": "gpu/codec.cuh",
+        "bytes": 4478,
+        "sha256": "eee6970998092b27de77c522c975774bc2db7737f49e5a97f405d0ade1d14f77"
+      },
+      {
+        "path": "gpu/convert_gpu.cu",
+        "bytes": 7325,
+        "sha256": "d64d67f81b47a1ca9e324ef2f13d7155deca1fae1c4be0fdd35c9b1e55fca754"
+      },
+      {
+        "path": "gpu/include/strata/qwen35/native/quant.hpp",
+        "bytes": 2757,
+        "sha256": "3f9552f3b4fa12bdd6d92c2c0fc4e94127f90ea6c58fc6707d6b7f1a82fb5429"
+      },
+      {
+        "path": "gpu_conversion.py",
+        "bytes": 2387,
+        "sha256": "2e6a313fe5c598ac96365ab90aeb7490630d23e586ad2250285ee3041485d1a5"
+      },
+      {
+        "path": "head_conversion.py",
+        "bytes": 8139,
+        "sha256": "7e5149e661fb86bc68e9f4fa33aa59adfce72c19587d3793bbb3118a495f80a0"
+      },
+      {
+        "path": "main_conversion.py",
+        "bytes": 8851,
+        "sha256": "fe65a2a2db5f6748a72e51f0459103ef016b012fa3edc92058a8c71b720a0ff1"
+      },
+      {
+        "path": "quantize_nvfp4.py",
+        "bytes": 4182,
+        "sha256": "ff231695865b54847d5d3a6920798053bdd110b2e7e24d854f10d82057512c80"
+      }
+    ],
+    "semantic": {
+      "passed": true,
+      "basis": [
+        "Main metadata order and raw record copy plus type40/tensor-scale selection match frozen writer for the known original basename; no new GGUF fields alter known061 layout.",
+        "quantize_nvfp4.py, GGUF reader and CUDA encode/decode source byteexact to frozen originals. CPU chunk/global/SF/RNE math unchanged.",
+        "Head uses full-main SHA, header SHA, original Q6-head SHA and norm SHA together before retaining historical logical name; new data never receives a forged historical identity.",
+        "Head full-tensor global two-pass source hash and output.weight/scale/norm order/offsets match old writer."
+      ]
+    },
+    "publication": {
+      "passed": true,
+      "basis": [
+        "Imports requiring NumPy/CUDA occur after Windows Ytemp confinement. No automatic compilation/model loading/inference.",
+        "All partial/status/receipt staging remain under Ytemp; explicit final output copy uses xb, fsync and full SHA; completed receipt published only after data succeeds.",
+        "Existing output reuse checks passed receipt, exact request/implementation identity, full file size+SHA; incomplete output/receipt or conflicting path refuses overwrite.",
+        "Both input and implementation source identities rechecked before publication; failure leaves recoverable partial/status without success claim."
+      ]
+    },
+    "limits": "Static source review only. No converter module imports, conversion, compilation, CUDA loading or new weight execution performed."
+  }
+}

@@ -11,7 +11,7 @@ ggml_tensor* build_canonical_expert_down(llm_graph_context& context,
                                         ggml_tensor* activation,
                                         ggml_tensor* selected,
                                         int layer_id) {
-    if (model.arch != LLM_ARCH_DEEPSEEK4 || layer_id < 0 ||
+    if ((model.arch != LLM_ARCH_DEEPSEEK4 && model.arch != LLM_ARCH_GLM5_NEXT) || layer_id < 0 ||
         std::size_t(layer_id) >= model.layers.size() || !activation || !selected ||
         activation->type != GGML_TYPE_F32 || selected->type != GGML_TYPE_I32 ||
         activation->ne[0] != model.hparams.n_embd || activation->ne[1] != selected->ne[1] ||

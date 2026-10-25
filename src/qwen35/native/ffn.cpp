@@ -1,4 +1,5 @@
 #include "strata/qwen35/native/tiny_batch.hpp"
+#include "strata/qwen35/native/nvfp4_runtime.hpp"
 #include "strata/qwen35/native/tiny_rows.hpp"
 #include "strata/qwen35/native/tiny_meta.hpp"
 #include "strata/qwen35/native/small_prefill.hpp"
@@ -11,14 +12,21 @@
 #include <algorithm>
 #include "strata/qwen35/native/weight_overlap.hpp"
 #include <chrono>
+#include <cstdlib>
 #include <string>
 
 namespace strata::qwen35::native {
-void check_cuda(cudaError_t status, const char *operation) {
-    if (status != cudaSuccess)
-        throw std::runtime_error(std::string(operation) + ": " + cudaGetErrorString(status));
-}
+
 namespace {
+bool byte_down_enabled() {
+    // The service choice is immutable for the process. The control retains
+    // the previous metadata-word service without changing model mathematics.
+    static const bool enabled = [] {
+        const char *value = std::getenv("STRATA_DENSE_SM120_BYTE_DOWN");
+        return !value || value[0] != '0';
+    }();
+    return enabled;
+}
 void release(Buffers &b) {
     // Up is a view into the second half of the owned Gate/Up allocation.
     cudaFree(b.gate); cudaFree(b.activation); cudaFree(b.output);
@@ -28,15 +36,7 @@ void release(Buffers &b) {
     b = {};
 }
 }
-Capabilities capabilities(int device) {
-    cudaDeviceProp p{};
-    check_cuda(cudaGetDeviceProperties(&p, device), "query native device capabilities");
-    if (p.major < 7) throw std::runtime_error("native FP16 Tensor Core path requires CC >= 7.0");
-    int clusters = 0;
-    check_cuda(cudaDeviceGetAttribute(&clusters, cudaDevAttrClusterLaunch, device), "query clusters");
-    return {p.major, p.minor, p.multiProcessorCount, p.sharedMemPerBlockOptin,
-            p.major >= 8, clusters != 0, p.major == 10};
-}
+
 Tile choose_tile(const Capabilities &caps, int rows, int tokens) {
     // The two compiled geometries have exact resource bounds. Crossovers need
     // measured service curves; no GPU name or model-specific N/K whitelist.
@@ -322,6 +322,10 @@ void Ffn::execute(const float *input, int tokens, cudaStream_t stream,bool diagn
     if (!input || tokens < 1 || tokens > max_tokens_)
         throw std::invalid_argument("invalid native FFN invocation");
     intermediates_materialized_=true;
+    if(gate_.quant==Quant::NVFP4){
+        if(!pp_gemm_)throw std::logic_error("NVFP4 FFN runtime missing");
+        intermediates_materialized_=nvfp4_ffn_fused(*pp_gemm_,gate_,up_,down_,input,buffers_,tokens,stream,diagnostic_projections);return;
+    }
     if(tiled_pair_&&(tokens!=32||stream!=tiled_stream_))throw std::invalid_argument("tiled Q4 view requires its PP32 stream lease");
     if(group_pair_&&(tokens!=32||stream!=group_stream_))throw std::invalid_argument("group Q4 canary requires its PP32 stream lease");
     if(gate_.layout==BlockLayout::Q4Tiles&&tokens!=1&&
@@ -335,11 +339,12 @@ void Ffn::execute(const float *input, int tokens, cudaStream_t stream,bool diagn
         vector_pair(gate_, up_, buffers_.quant_input, buffers_.gate, buffers_.up, buffers_.activation, stream);
         vector_quantize(buffers_.activation, buffers_.quant_input, down_.columns, stream);
         vector_linear(down_, buffers_.quant_input, buffers_.output, stream);
-    } else if(tiny_batches_&&(tokens==2||tokens==3)){
+    } else if(tiny_batches_&&(tokens>=2&&tokens<=4)){
         void *codes=buffers_.half_input;
         const auto pair=tiny_row_ffn_&&gate_.quant==Quant::Q4K&&tokens==2?tiny_row_pair:tiny_batch_pair;
-        const auto linear=tiny_meta_ffn_&&tokens==3&&down_.quant==Quant::Q4K?tiny_meta_linear:
-            tiny_row_ffn_&&down_.quant==Quant::Q4K?tiny_row_linear:tiny_batch_linear;
+        const bool byte_down=caps_.major==12&&caps_.minor==0&&byte_down_enabled();
+        const auto linear=tiny_meta_ffn_&&!byte_down&&tokens>=3&&down_.quant==Quant::Q4K?tiny_meta_linear:
+            tiny_row_ffn_&&tokens<4&&down_.quant==Quant::Q4K?tiny_row_linear:tiny_batch_linear;
         tiny_batch_quantize(input,codes,gate_.columns,tokens,stream);
         pair(gate_,up_,codes,buffers_.gate,buffers_.up,buffers_.activation,tokens,stream);
         tiny_batch_quantize(buffers_.activation,codes,down_.columns,tokens,stream);

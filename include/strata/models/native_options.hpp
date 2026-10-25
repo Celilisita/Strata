@@ -39,10 +39,12 @@ struct NativeOptions {
         if (o.family == "qwen35_moe") {
             if ((o.variant != "minicpm_v47" && o.variant != "qwen36_35b") || o.aux.empty() || o.mtp ||
                 (o.dspark && o.variant != "minicpm_v47") ||
-                (o.dspark && o.slots != 1) || o.context > 196608)
+                (o.dspark && o.slots != 1))
                 throw std::invalid_argument("Qwen35 MoE requires its explicit variant; DSpark is MiniCPM single slot");
         } else if (o.family == "qwen35_dense") {
-            if (o.variant != "qwen38_27b" || o.slots != 1 || o.dspark ||
+            if ((o.variant != "qwen38_27b" && o.variant != "qwen38_27b_uncensored_nvfp4" &&
+                 o.variant != "qwen36_27b" && o.variant != "qwen35_27b_nvfp4") ||
+                o.slots != 1 || o.dspark ||
                 (o.kv != "ram8k-reuse" && o.kv != "full"))
                 throw std::invalid_argument("invalid Dense variant, slot or KV policy");
         } else throw std::invalid_argument("unsupported native family");

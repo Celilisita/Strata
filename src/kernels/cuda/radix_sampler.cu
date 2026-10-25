@@ -74,7 +74,9 @@ __global__ void final_mass(const float* scores, double* mass, int n,
         ((p.greedy || p.temperature <= 0) ? 1.0 : double(p.temperature))) : 0.0;
 }
 __global__ void draw(const float* logits, const int* ids, const double* prefix,
-    int n, SamplerParams p, const Control* c, SamplePick* result, const int* failed) {
+    int n, SamplerParams p, const Control* c, SamplePick* result, const int* failed,
+    const uint64_t* counter, unsigned offset) {
+    if (counter) p.counter = *counter + offset;
     const int failure = failed ? *failed : 0;
     const int bad = failure ? -2 - failure : (c->first_bad == n ? -1 : c->first_bad);
     int chosen = 0;
@@ -90,6 +92,10 @@ __global__ void draw(const float* logits, const int* ids, const double* prefix,
     }
     const double mass = prefix[chosen] - (chosen ? prefix[chosen - 1] : 0.0);
     *result = {ids[chosen], bad, logits[ids[chosen]], float(mass / total)};
+}
+__global__ void export_pick(const SamplePick* pick, int* id, unsigned* invalid) {
+    *id = pick->first_bad == -1 ? pick->id : 0;
+    *invalid = unsigned(pick->first_bad != -1);
 }
 } // namespace
 
@@ -124,6 +130,11 @@ void RadixSampler::validate(const SamplerParams& p) {
 }
 void RadixSampler::sample(const float* logits, const int* history, int length,
     const SamplerParams& p, void* raw_stream, const int* failed) {
+    sample_counter(logits, history, length, p, raw_stream, nullptr, 0, failed);
+}
+void RadixSampler::sample_counter(const float* logits, const int* history, int length,
+    const SamplerParams& p, void* raw_stream, const uint64_t* counter,
+    unsigned offset, const int* failed) {
     validate(p);
     if (!logits || length < 0 || (length && !history))
         throw std::invalid_argument("invalid GPU sampler inputs");
@@ -145,7 +156,12 @@ void RadixSampler::sample(const float* logits, const int* history, int length,
     final_mass<<<blocks, 256, 0, stream>>>(s.sorted_scores.as<float>(), s.mass.as<double>(), s.n, p, s.control.as<Control>());
     check(cub::DeviceScan::InclusiveSum(s.temporary->p, s.scan_bytes, s.mass.as<double>(), s.prefix.as<double>(), s.n, stream));
     draw<<<1, 1, 0, stream>>>(logits, s.sorted_ids.as<int>(), s.prefix.as<double>(), s.n, p,
-        s.control.as<Control>(), s.pick.as<SamplePick>(), failed);
+        s.control.as<Control>(), s.pick.as<SamplePick>(), failed, counter, offset);
+    check(cudaGetLastError());
+}
+void RadixSampler::write_pick(int* id, unsigned* invalid, void* raw_stream) const {
+    if (!id || !invalid) throw std::invalid_argument("invalid sampler pick destination");
+    export_pick<<<1, 1, 0, static_cast<cudaStream_t>(raw_stream)>>>(state_->pick.as<SamplePick>(), id, invalid);
     check(cudaGetLastError());
 }
 const SamplePick* RadixSampler::result() const { return state_->pick.as<SamplePick>(); }

@@ -1,24 +1,36 @@
+#include "strata/kernels/dp4a.hpp"
 // Canonical pinned Q4_K/Q6_K scale/min expressions. Integer-dot providers
 // (DP4A and FP16 WMMA) share this arithmetic and its operation order.
-__device__ __forceinline__ float q4_q8_finalize(const int* dots, const int* sums,
+// Both overloads form the same exactly representable scaled integer product.
+// Tensor-core dots use bounded integer-valued F32; explicit rounding prevents
+// the compiler from reassociating this multiply with the following Q8 scale.
+__device__ __forceinline__ float native_scaled_dot(int dot, int scale) {
+    return float(dot*scale);
+}
+__device__ __forceinline__ float native_scaled_dot(float dot, int scale) {
+    return __fmul_rn(dot,float(scale));
+}
+template<class Dot>
+__device__ __forceinline__ float q4_q8_finalize(const Dot* dots, const int* sums,
     const uint8_t* sc, const uint8_t* m, const half2& dm4, const float* d8) {
     float sumf_d = 0.0f;
     float sumf_m = 0.0f;
 #pragma unroll
     for (int i = 0; i < 2; ++i) {
-        sumf_d += d8[i] * (dots[i] * sc[i]);
+        sumf_d += d8[i] * native_scaled_dot(dots[i],sc[i]);
         sumf_m += d8[i] * (sums[i] * m[i]);
     }
     const float2 dm4f = __half22float2(dm4);
     return dm4f.x * sumf_d - dm4f.y * sumf_m;
 }
 
-__device__ __forceinline__ float q6_q8_finalize(const int* dots,
+template<class Dot>
+__device__ __forceinline__ float q6_q8_finalize(const Dot* dots,
     const int8_t* scales, float d, const float* d8) {
     float sumf = 0.0f;
 #pragma unroll
     for (int i = 0; i < 2; ++i)
-        sumf += d8[i] * (dots[i] * scales[4 * i]);
+        sumf += d8[i] * native_scaled_dot(dots[i],scales[4*i]);
     return d * sumf;
 }
 
@@ -32,8 +44,8 @@ __device__ __forceinline__ float q4_q8_dot_impl(
     for (int i = 0; i < 2; ++i) {
         const int v0i = (v[0] >> (4 * i)) & 0x0f0f0f0f;
         const int v1i = (v[1] >> (4 * i)) & 0x0f0f0f0f;
-        const int dot1 = __dp4a(v1i, u[2 * i + 1], __dp4a(v0i, u[2 * i], 0));
-        const int dot2 = __dp4a(0x01010101, u[2 * i + 1], __dp4a(0x01010101, u[2 * i], 0));
+        const int dot1 = STRATA_DP4A(v1i, u[2 * i + 1], STRATA_DP4A(v0i, u[2 * i], 0));
+        const int dot2 = STRATA_DP4A(0x01010101, u[2 * i + 1], STRATA_DP4A(0x01010101, u[2 * i], 0));
         dots[i] = dot1;
         sums[i] = dot2;
     }
@@ -51,8 +63,7 @@ __device__ __forceinline__ float q6_q8_dot_impl(int vl, int vh, const int* __res
         const int vil = (vl >> (4 * i)) & 0x0f0f0f0f;
         const int vih = ((vh >> (4 * i)) << 4) & 0x30303030;
         const int vi = __vsubss4(vil | vih, 0x20202020);
-        dots[i] = __dp4a(vi, u[i], 0);
+        dots[i] = STRATA_DP4A(vi, u[i], 0);
     }
     return q6_q8_finalize(dots, scales, d, d8);
 }
-

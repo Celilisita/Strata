@@ -1,0 +1,23 @@
+{
+  "family": "qwen35_dense_v100",
+  "backend": "completed_v100",
+  "source_target": "strata-qwen-v100-native",
+  "variants": {
+    "qwen35_27b": "frozen raw NVFP4 mixed inventory without input_scale; no all-Q8 model claim",
+    "qwen36_27b": "frozen original Q4_K/Q6_K inventory with Q6_K output head"
+  },
+  "default_enabled": false,
+  "context": 262144,
+  "slots": 1,
+  "kv_policy": "full",
+  "kv_bits": 8,
+  "sampling": {"temperature": 0.6, "top_k": 20, "top_p": 0.95, "min_p": 0},
+  "sampled_mtp_default": "optional feature off; complete ordinary RadixSampler generation",
+  "native_policies_default": [],
+  "source_cli_family": "qwen35_dense inside the dedicated new executable only",
+  "config_binding_tool": "tools/configure_completed_qwen.py",
+  "tokenizer_template": "actual GGUF metadata, current shared Strata tokenizer and original GGUF Jinja template",
+  "dll_binding": "explicit existing absolute dll_dirs; engine child environment only",
+  "vision": "not exposed by this text factory; frozen C++ PREPAREV retained without a new vision claim",
+  "quality_status": "historical candidate/HOLD limits retained; no new inference or SM120 quality/performance validation"
+}

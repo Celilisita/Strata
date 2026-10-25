@@ -9,6 +9,7 @@
 # and is wrong about its own performance, which is the worst of both outcomes.
 cmake_minimum_required(VERSION 3.24)
 project(strata VERSION 0.1.41 LANGUAGES CXX)
+include(cmake/integration_dependencies.cmake)
 # EXPERIMENTAL: the Intel Arc engine, the SYCL port in sycl/ (PR #423; icpx + oneMKL, docs/INTEL_ARC.md). It is its
 # own project that takes the unported sources from src/; with this on, nothing below is configured.
 option(STRATA_ENABLE_SYCL "EXPERIMENTAL: build the Intel Arc (SYCL) engine from sycl/ - docs/INTEL_ARC.md" OFF)
@@ -1198,7 +1199,8 @@ if(STRATA_NATIVE_EXPERTS)
       set(${_f} OFF CACHE BOOL "" FORCE)
     endforeach()
   else()
-    set(GGML_NATIVE ON CACHE BOOL "" FORCE)
+    # Honor an explicit portable CPU dependency choice in an isolated build.
+    set(GGML_NATIVE ON CACHE BOOL "")
   endif()
   if(STRATA_DEEPSEEK_V4)
     if(NOT TARGET ggml-base)
@@ -1602,3 +1604,9 @@ option(STRATA_PRODUCTION_ONLY "Exclude diagnostics from the default build" ON)
 include(cmake/production_targets.cmake)
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/mtp_q8_check.cmake)
+
+# Integrated Qwen MoE production sources; all experiment targets remain outside this tree.
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/strata_titanrtx.cmake")
+
+# Completed families use the same source-built backend and normal frontend.
+include(cmake/completed_integrations.cmake)

@@ -46,6 +46,10 @@ struct BatchWorkspace {
     uint64_t mmq_projection_calls = 0, tensor_attention_calls = 0;
     int capacity = 0;
     int half_width = 0, half_count = 0;
+    // Nonowning originalF32 view, rebound by each actualQ8 preparation.
+    const float* raw_input = nullptr;
+    int raw_input_width = 0, raw_input_count = 0;
+    void clear_raw_input() { raw_input=nullptr; raw_input_width=0; raw_input_count=0; }
     size_t owned_bytes() const {
         size_t total = 0;
         for (const auto* buffer : {&phase_arena, &hidden, &norm, &mixer, &qkv, &z, &alpha,

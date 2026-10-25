@@ -78,7 +78,9 @@ __global__ void conv_silu(float* __restrict__ history, const float* __restrict__
     for (int tap = 0; tap < 3; ++tap) history[c * 3 + tap] = values[tap];
 }
 
-template<bool Scan>
+#include "native_gdn_conv_parallel.cuh"
+
+template<bool Scan, bool Exp = false>
 __global__ void gate_softplus(const float* __restrict__ alpha, const float* __restrict__ dt,
                                const float* __restrict__ ssm_a, float* __restrict__ gate, int count, int heads) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -86,7 +88,8 @@ __global__ void gate_softplus(const float* __restrict__ alpha, const float* __re
     const int h = Scan ? i % heads : i;
     const float value = __fadd_rn(alpha[i], dt[h]);
     const float softplus = value > 20.0f ? value : logf(1.0f + expf(value));
-    gate[i] = softplus * ssm_a[h];
+    const float log_gate = softplus * ssm_a[h];
+    gate[i] = Exp ? expf(log_gate) : log_gate;
 }
 
 struct Span { const void* pointer; size_t bytes; };
@@ -132,6 +135,24 @@ void native_gdn_conv_scan(float* history, const float* input, const float* weigh
         history, input, weights, nullptr, output, channels, tokens, nullptr);
     check_launch();
 }
+void native_gdn_conv_scan_parallel(float* history, const float* input, const float* weights,
+                                  float* output, int channels, int tokens, void* stream) {
+    count_and_stream(channels, stream);
+    if (tokens < 1 || tokens > 8192) throw std::invalid_argument("invalid parallel convolution token count");
+    const size_t bytes = size_t(channels) * sizeof(float);
+    const Span writable[] = {{history, 3 * bytes}, {output, size_t(tokens) * bytes}};
+    const Span inputs[] = {{input, size_t(tokens) * bytes}, {weights, 4 * bytes}};
+    for (auto span : writable) valid(span);
+    for (auto span : inputs) valid(span);
+    disjoint(writable[0], writable[1]);
+    for (auto dst : writable) for (auto src : inputs) disjoint(dst, src);
+    const unsigned blocks = unsigned((channels + 255) / 256);
+    conv_silu_parallel<<<dim3(blocks, unsigned((tokens + ConvWindow - 1) / ConvWindow)),
+        256, 0, static_cast<cudaStream_t>(stream)>>>(history, input, weights, output, channels, tokens);
+    check_launch();
+    conv_history_update<<<blocks, 256, 0, static_cast<cudaStream_t>(stream)>>>(history, input, channels, tokens);
+    check_launch();
+}
 void native_gdn_gate_scan(const float* alpha, const float* dt, const float* ssm_a,
                            float* gate, int heads, int tokens, void* stream) {
     count_and_stream(heads, stream);
@@ -146,5 +167,14 @@ void native_gdn_gate_scan(const float* alpha, const float* dt, const float* ssm_
     gate_softplus<true><<<unsigned((heads * tokens + 255) / 256), 256, 0, static_cast<cudaStream_t>(stream)>>>(
         alpha, dt, ssm_a, gate, heads * tokens, heads);
     check_launch();
+}
+void native_gdn_gate_scan_alpha(const float* alpha,const float* dt,const float* ssm_a,
+    float* gate,int heads,int tokens,void* stream) {
+    count_and_stream(heads,stream);
+    if(tokens<1||tokens>8192||int64_t(heads)*tokens>1048576)throw std::invalid_argument("invalid GDN alpha tokens");
+    const size_t bytes=size_t(heads)*sizeof(float);const Span writable{gate,size_t(tokens)*bytes};valid(writable);
+    for(auto source:{Span{alpha,size_t(tokens)*bytes},Span{dt,bytes},Span{ssm_a,bytes}}){valid(source);disjoint(writable,source);}
+    gate_softplus<true,true><<<unsigned((heads*tokens+255)/256),256,0,static_cast<cudaStream_t>(stream)>>>(
+        alpha,dt,ssm_a,gate,heads*tokens,heads);check_launch();
 }
 } // namespace strata::kernels

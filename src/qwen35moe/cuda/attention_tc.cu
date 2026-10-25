@@ -1,13 +1,34 @@
 #include "strata/qwen35moe/attention_tc.hpp"
+#include "attention_register.hpp"
+#include "attention_rows32.hpp"
+#include "attention_rows64.hpp"
+#include "attention_rows64_early.hpp"
+#include "attention_rows64_early_qpad8.hpp"
+#include "attention_rows64_qpad8.hpp"
+#include "attention_rows64_subgroup4.hpp"
+#include "attention_rows64_fast_exp.hpp"
+#include "attention_rows64_warps8.hpp"
+#include "attention_rows32_direct.hpp"
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <mma.h>
 #include <math_constants.h>
 #include <stdexcept>
+#include <cstdlib>
+#include <cstring>
+#include <array>
+#include <limits>
+#include <utility>
 
 namespace strata::qwen35moe {
 namespace {
 namespace wm = nvcuda::wmma;
+bool register_output_enabled() {
+    const char* flag=std::getenv("STRATA_QWEN35_ATTN_REGISTER_OUTPUT");
+    if(!flag || std::strcmp(flag,"0")==0) return false;
+    if(std::strcmp(flag,"1")!=0) throw std::invalid_argument("ATTN_REGISTER_OUTPUT must be0 or1");
+    return true;
+}
 constexpr int Rows=16, Keys=64, Dim=256, Heads=16, CacheStride=512;
 __device__ float maximum(float x) {
     for(int d=16; d; d>>=1) x=fmaxf(x,__shfl_xor_sync(0xffffffffu,x,d));
@@ -173,11 +194,126 @@ __global__ __launch_bounds__(128,(Compact || Reuse) ? 3 : 2) void prefill(const 
     }
 #endif
 }
+#include "attention_tc_register.cuh"
+#include "attention_tc_query32.cuh"
+#include "attention_tc_halfpv.cuh"
+#include "attention_tc_gqa_async.cuh"
+#include "attention_tc_gqa32_async.cuh"
+#include "attention_tc_gqa_key64.cuh"
+#include "attention_tc_query64.cuh"
+void prepare_query64() {
+    // One selected device owns this runtime; configure before a launch/capture.
+    static const bool configured=[] {
+        const auto error=cudaFuncSetAttribute(prefill_query64,cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                              int(Query64SharedBytes));
+        if(error!=cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+        return true;
+    }();
+    (void)configured;
 }
-void attention_tc_prefill(const float* q,uint16_t* k,uint16_t* v,
-    int first,int count,int capacity,float* out,void* stream,bool compact,bool reuse) {
+int selected_gqa_async() {
+    static const int enabled=[] {
+        const char* raw=std::getenv("STRATA_QWEN35_ATTN_GQA_ASYNC");
+        if(!raw || !std::strcmp(raw,"0")) return 0;
+        if(!std::strcmp(raw,"1")) return 1;
+        if(!std::strcmp(raw,"2")) return 2;
+        throw std::invalid_argument("attention GQA_ASYNC requires0,1 or2");
+    }();
+    return enabled;
+}
+void prepare_gqa_async() {
+    int device=0;auto error=cudaGetDevice(&device);
+    if(error!=cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+    static thread_local int prepared=-1;
+    if(prepared==device) return;
+    cudaDeviceProp properties{};error=cudaGetDeviceProperties(&properties,device);
+    if(error!=cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+    if(properties.major!=12 || properties.minor!=0) throw std::invalid_argument("GQA async requires SM120");
+    error=cudaFuncSetAttribute(prefill_gqa_async,cudaFuncAttributeMaxDynamicSharedMemorySize,GqaAsyncSharedBytes);
+    if(error!=cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+    prepared=device;
+}
+void prepare_gqa32_async() {
+    int device=0;auto error=cudaGetDevice(&device);
+    if(error!=cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+    static thread_local int prepared=-1;
+    if(prepared==device) return;
+    cudaDeviceProp properties{};error=cudaGetDeviceProperties(&properties,device);
+    if(error!=cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+    if(properties.major!=12 || properties.minor!=0) throw std::invalid_argument("GQA async requires SM120");
+    error=cudaFuncSetAttribute(prefill_gqa32_async,cudaFuncAttributeMaxDynamicSharedMemorySize,Gqa32AsyncSharedBytes);
+    if(error!=cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+    prepared=device;
+}
+bool selected_half_pv() {
+    static const bool enabled=[] {
+        const char* raw=std::getenv("STRATA_QWEN35_ATTN_TC_HALF_PV");
+        if(!raw || !std::strcmp(raw,"0")) return false;
+        if(!std::strcmp(raw,"1")) return true;
+        throw std::invalid_argument("attention HALF_PV requires0 or1");
+    }();
+    return enabled;
+}
+int selected_query_rows() {
+    static const int rows=[] {
+        const char* value=std::getenv("STRATA_QWEN35_ATTN_TC_QUERY_ROWS");
+        if(!value || !std::strcmp(value,"16")) return 16;
+        if(!std::strcmp(value,"32")) return 32;
+        if(!std::strcmp(value,"64")) return 64;
+        throw std::invalid_argument("attention query rows require16,32 or64");
+    }();
+    return rows;
+}
+}
+bool attention_rows32_selected(int first,int count) {
+    const char* flag=std::getenv("STRATA_QWEN35_ATTN_QUERY_ROWS32");
+    if(!flag || std::strcmp(flag,"0")==0) return false;
+    if(std::strcmp(flag,"1")!=0) throw std::invalid_argument("ATTN_QUERY_ROWS32 must be0 or1");
+    return count>=1024 && first+count>=8192;
+}
+void attention_tc_prefill_rows32_direct_request(const float* q,uint16_t* k,uint16_t* v,
+    int first,int count,int capacity,float* out,void* stream,bool compact,bool reuse,bool request_direct) {
     if(!q||!k||!v||!out||!stream||!attention_tc_fits(first,count,capacity) || (compact && reuse))
         throw std::invalid_argument("unsupported Tensor Core PP attention geometry");
+    if(reuse && register_output_enabled()) {
+        if(attention_rows64_early_qpad8_selected(first,count,capacity) &&
+           attention_rows64_early_qpad8_prefill(q,k,v,first,count,capacity,out,stream)) return;
+        if(attention_rows64_early_selected(first,count,capacity) &&
+           attention_rows64_early_prefill(q,k,v,first,count,capacity,out,stream)) return;
+        if(request_direct && attention_rows32_direct_candidate(first,count,capacity) &&
+           attention_rows32_direct_prefill(q,k,v,first,count,capacity,out,stream)) return;
+        const bool rows64=attention_rows64_selected(first,count,capacity);
+        if(attention_rows32_selected(first,count)) {
+            if(attention_rows64_warps8_selected(first,count,capacity) &&
+               attention_rows64_warps8_prefill(q,k,v,first,count,capacity,out,stream)) return;
+            if(rows64 && attention_rows64_qpad8_selected(first,count,capacity) &&
+               attention_rows64_qpad8_prefill(q,k,v,first,count,capacity,out,stream)) return;
+            if(rows64 && attention_rows64_subgroup4_selected(first,count,capacity) &&
+               attention_rows64_subgroup4_prefill(q,k,v,first,count,capacity,out,stream)) return;
+            if(rows64 && attention_rows64_fast_exp_selected(first,count,capacity) &&
+               attention_rows64_fast_exp_prefill(q,k,v,first,count,capacity,out,stream)) return;
+            if(rows64 && attention_rows64_prefill(q,k,v,first,count,capacity,out,stream)) return;
+            if(attention_rows32_prefill(q,k,v,first,count,capacity,out,stream)) return;
+        }
+        attention_register_prefill(q,k,v,first,count,capacity,out,stream);
+        return;
+    }
+    const int query_rows=compact ? selected_query_rows() : 16;
+    const int gqa=selected_gqa_async();
+    const bool key64=selected_gqa_key64();
+    if(gqa && compact && query_rows==32 && count>=1024 && first+count<=30720) {
+        if(gqa==2 && key64) attention_tc_prefill_gqa_key64(q,k,v,first,count,capacity,out,stream);
+        else if(gqa==2) attention_tc_prefill_gqa32_async(q,k,v,first,count,capacity,out,stream);
+        else attention_tc_prefill_gqa_async(q,k,v,first,count,capacity,out,stream);
+        return;
+    }
+    const bool half_pv=selected_half_pv();
+    if(half_pv && compact && query_rows==32 && count>=1024 && first+count<=30720) {
+        attention_tc_prefill_half_pv(q,k,v,first,count,capacity,out,stream); return;
+    }
+    if(compact && query_rows!=16 && count>=1024) {
+        attention_tc_prefill_query_rows(q,k,v,first,count,capacity,out,stream,query_rows); return;
+    }
     const int width=first+count, padded=((width+63)/64)*64;
     auto s=static_cast<cudaStream_t>(stream);
     if(padded>width) zero_tail<<<((padded-width)*CacheStride+255)/256,256,0,s>>>(
@@ -185,18 +321,18 @@ void attention_tc_prefill(const float* q,uint16_t* k,uint16_t* v,
     const dim3 grid(Heads,(count+Rows-1)/Rows);
     if(reuse) prefill<false,true><<<grid,128,0,s>>>(q,reinterpret_cast<const half*>(k),
         reinterpret_cast<const half*>(v),first,count,out);
-    else if(compact) prefill<true,false><<<grid,128,0,s>>>(q,reinterpret_cast<const half*>(k),
+    else if(compact) prefill_register<<<grid,128,0,s>>>(q,reinterpret_cast<const half*>(k),
         reinterpret_cast<const half*>(v),first,count,out);
     else prefill<false,false><<<grid,128,0,s>>>(q,reinterpret_cast<const half*>(k),
         reinterpret_cast<const half*>(v),first,count,out);
     const auto error=cudaGetLastError();
     if(error!=cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
-AttentionTcResources attention_tc_resources(bool compact,bool reuse) {
-    cudaFuncAttributes attr{};
-    const auto error=reuse?cudaFuncGetAttributes(&attr,prefill<false,true>):
-        compact?cudaFuncGetAttributes(&attr,prefill<true,false>):cudaFuncGetAttributes(&attr,prefill<false,false>);
-    if(error!=cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
-    return {attr.numRegs,attr.sharedSizeBytes,attr.localSizeBytes};
+void attention_tc_prefill(const float* q,uint16_t* k,uint16_t* v,
+    int first,int count,int capacity,float* out,void* stream,bool compact,bool reuse) {
+    attention_tc_prefill_rows32_direct_request(q,k,v,first,count,capacity,out,stream,compact,reuse,
+        attention_rows32_direct_selected(first,count,capacity));
 }
+#include "attention_tc_query_wrappers.inl"
+
 }

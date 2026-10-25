@@ -6,8 +6,12 @@
 #include <memory>
 #include <vector>
 
+namespace strata::glm5_next {struct PartialDownPhase;}
 namespace strata::deepseek_v4 {
 struct DeviceCacheDmaCosts {
+    uint64_t graph_compute_calls=0,graph_captures=0,graph_launches=0;
+    bool causal_launch_host_enabled=false;
+    uint64_t graph_launch_host_ns=0,graph_launch_host_max_ns=0,graph_launch_host_count=0,graph_launch_host_errors=0;
     uint64_t submit_ns = 0, commit_wait_ns = 0;
     // memcpy, slab event record, directory copy, directory event record,
     // commit event wait, slab event wait, frequency copy/record/wait,
@@ -25,21 +29,31 @@ struct DeviceCacheDmaCosts {
 };
 class DeviceCacheDma {
 public:
-    explicit DeviceCacheDma(ggml_backend_t backend, ExpertStaging* source_registration, bool prepare_all_streams = true);
+    explicit DeviceCacheDma(ggml_backend_t backend, ExpertStaging* source_registration,
+                           bool prepare_all_streams = true, bool blocking_host_wait = false,
+                           bool pack_fragments = false,bool causal_phases = false);
     ~DeviceCacheDma();
     DeviceCacheDma(const DeviceCacheDma&) = delete;
     DeviceCacheDma& operator=(const DeviceCacheDma&) = delete;
     DeviceMissPacket* packet() const noexcept;
     uintptr_t device_packet() const noexcept;
+    // Explicit diagnostic only; caller owns full GPU/worker quiescence.
+    void prepare_partial_down_diagnostic();
+    strata::glm5_next::PartialDownPhase* partial_down_phase() const noexcept;
+    uintptr_t partial_down_device_phase() const noexcept;
     uint64_t timeout_ns() const noexcept;
     // Bind once before this thread uploads/commits. Rebinding during a waiting
     // compute kernel can serialize with another thread's context operations.
     void bind_thread();
     void set_active(bool);
     void upload(ggml_tensor* destination, const void* source, size_t offset, size_t bytes);
-    void commit(void* device_directory, const std::array<int32_t, device_cache_max_layers * 256>& directory);
+    void commit(void* device_directory, const int32_t* directory, size_t count);
+    template<class Directory> void commit(void* destination, const Directory& directory) {
+        commit(destination, directory.data(), directory.size());
+    }
     void seal_background();
     bool background_ready();
+    void wait_background();
     void publish_native_slots(bool payload_pending = true);
     void read_frequency(const void*, std::vector<uint32_t>&);
     void read_miss_frequency(std::vector<uint32_t>&);

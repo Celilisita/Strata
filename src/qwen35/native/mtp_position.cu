@@ -27,14 +27,14 @@ __global__ void cache(const float *x,unsigned char *out,size_t blocks,int stride
 }
 void mtp_positions(int *out,const int *start,int offset,int tokens,int shift,
     DecodeCursor *cursor,int heads,DecodeRounding rounding,cudaStream_t stream){
-    if(!out||!start||offset<0||offset>2||tokens<1||tokens>3||(shift!=0&&shift!=1))
+    if(!out||!start||offset<0||offset>3||tokens<1||tokens>4||(shift!=0&&shift!=1))
         throw std::invalid_argument("invalid bounded MTP graph position");
     positions<<<1,32,0,stream>>>(out,start,offset,tokens,shift,cursor,heads,rounding);
     check_cuda(cudaGetLastError(),"MTP graph actual position and KV partition");
 }
 void q8_cache_write_positions(const float *x,void *out,int dim,int heads,int tokens,
     const int *positions,int shift,int capacity,cudaStream_t stream){
-    if(!x||!out||!positions||dim%32||heads<1||tokens<1||tokens>3||(shift!=0&&shift!=1)||capacity<3)
+    if(!x||!out||!positions||dim%32||heads<1||tokens<1||tokens>4||(shift!=0&&shift!=1)||capacity<3)
         throw std::invalid_argument("invalid bounded MTP graph Q8 span");
     const int stride=heads*(dim/32);const size_t blocks=size_t(tokens)*stride;
     cache<<<unsigned((blocks+3)/4),128,0,stream>>>(x,static_cast<unsigned char *>(out),blocks,stride,positions,shift,capacity);

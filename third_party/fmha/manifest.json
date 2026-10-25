@@ -1,0 +1,108 @@
+{
+  "repo": "NVIDIA/cutlass",
+  "commit": "0b55a2f691d69981583568fd9eb69687b1f0de8a",
+  "archive_sha256": "9e205e91f7faa0add2e68dad52dbc9932a6520fb01b033c7971d5b0267983d72",
+  "scope": "Unmodified official41 kernel_forward quoted-include transitive closure; commoncutlass/CUDAheaders alreadyresident. Reference/vendor sources notowned Strata implementation.",
+  "files": {
+    "debug_utils.h": {
+      "sha256": "bbcdaec6bf82dfc2c35f861f51640fcec338dbb43ff9972300d9dfc1091a8a96",
+      "bytes": 11869,
+      "upstream": "cutlass-0b55a2f691d69981583568fd9eb69687b1f0de8a/examples/41_fused_multi_head_attention/debug_utils.h"
+    },
+    "epilogue/epilogue_pipelined.h": {
+      "sha256": "e50fab815d904fde5053e4da48ee55a4a5c7f136594e26b7d099c5ba7221a231",
+      "bytes": 22296,
+      "upstream": "cutlass-0b55a2f691d69981583568fd9eb69687b1f0de8a/examples/41_fused_multi_head_attention/epilogue/epilogue_pipelined.h"
+    },
+    "epilogue/epilogue_rescale_output.h": {
+      "sha256": "2755d045a6b78e6898b4a31f7ed750e09ae06f4d0f01adc53f225aa71a01b0f7",
+      "bytes": 9101,
+      "upstream": "cutlass-0b55a2f691d69981583568fd9eb69687b1f0de8a/examples/41_fused_multi_head_attention/epilogue/epilogue_rescale_output.h"
+    },
+    "epilogue/epilogue_thread_apply_logsumexp.h": {
+      "sha256": "0369f6487f851615369b8e9398f8fcf2dbe756a683e8fadb57b41082f41c5366",
+      "bytes": 6118,
+      "upstream": "cutlass-0b55a2f691d69981583568fd9eb69687b1f0de8a/examples/41_fused_multi_head_attention/epilogue/epilogue_thread_apply_logsumexp.h"
+    },
+    "gemm/custom_mma.h": {
+      "sha256": "eaca26af82066943e737d40bcd63ef0f4a8ea4b1d6dada663c4cf07ddd92e8b0",
+      "bytes": 3994,
+      "upstream": "cutlass-0b55a2f691d69981583568fd9eb69687b1f0de8a/examples/41_fused_multi_head_attention/gemm/custom_mma.h"
+    },
+    "gemm/custom_mma_base.h": {
+      "sha256": "301df1671fbfbaa7f3ad17a3d82da80d34d8894bf57e475525244be2777f1be0",
+      "bytes": 6248,
+      "upstream": "cutlass-0b55a2f691d69981583568fd9eb69687b1f0de8a/examples/41_fused_multi_head_attention/gemm/custom_mma_base.h"
+    },
+    "gemm/custom_mma_multistage.h": {
+      "sha256": "40e684fce57b75457107e0ba806d13ccb93f4ebfde4db3fabacc9a6f22dd9fc7",
+      "bytes": 26967,
+      "upstream": "cutlass-0b55a2f691d69981583568fd9eb69687b1f0de8a/examples/41_fused_multi_head_attention/gemm/custom_mma_multistage.h"
+    },
+    "gemm/custom_mma_pipelined.h": {
+      "sha256": "e7fc126c9facfe6c30dc9553cc11012cea4a8c9144908e222872c091a335de6e",
+      "bytes": 14105,
+      "upstream": "cutlass-0b55a2f691d69981583568fd9eb69687b1f0de8a/examples/41_fused_multi_head_attention/gemm/custom_mma_pipelined.h"
+    },
+    "gemm/find_default_mma.h": {
+      "sha256": "88ce5e12ee67bb3b1524f7e108236c0b9b8ce79a0df6a9098478c12fcb432ea5",
+      "bytes": 6783,
+      "upstream": "cutlass-0b55a2f691d69981583568fd9eb69687b1f0de8a/examples/41_fused_multi_head_attention/gemm/find_default_mma.h"
+    },
+    "gemm/mma_accum_lambda_iterator.h": {
+      "sha256": "accfb930f650a3bdcba40d956e5aae4338ca15b8e0e62f4c4354a391f7fe0c28",
+      "bytes": 13959,
+      "upstream": "cutlass-0b55a2f691d69981583568fd9eb69687b1f0de8a/examples/41_fused_multi_head_attention/gemm/mma_accum_lambda_iterator.h"
+    },
+    "gemm/mma_from_smem.h": {
+      "sha256": "95590ab909c5eb8982879a80a8507a660a8861fe97faa8e846eee5ab234b555f",
+      "bytes": 68672,
+      "upstream": "cutlass-0b55a2f691d69981583568fd9eb69687b1f0de8a/examples/41_fused_multi_head_attention/gemm/mma_from_smem.h"
+    },
+    "gemm_kernel_utils.h": {
+      "sha256": "1421fcc8a1032124c8136570747c0d7b84ea2efbf7454ce0a746694bfcc3c3a4",
+      "bytes": 11079,
+      "upstream": "cutlass-0b55a2f691d69981583568fd9eb69687b1f0de8a/examples/41_fused_multi_head_attention/gemm_kernel_utils.h"
+    },
+    "iterators/default_warp_iterator_from_smem.h": {
+      "sha256": "27e338222582c90761f1c5ded5674fdfc8732cdf577667b1cefcf2ce50611ac5",
+      "bytes": 5776,
+      "upstream": "cutlass-0b55a2f691d69981583568fd9eb69687b1f0de8a/examples/41_fused_multi_head_attention/iterators/default_warp_iterator_from_smem.h"
+    },
+    "iterators/make_residual_last.h": {
+      "sha256": "d9fb04ce540a4ab35e9897d78cd2c7cce676cb015ef2677b7ad1b95ddac98ec9",
+      "bytes": 3142,
+      "upstream": "cutlass-0b55a2f691d69981583568fd9eb69687b1f0de8a/examples/41_fused_multi_head_attention/iterators/make_residual_last.h"
+    },
+    "iterators/predicated_tile_access_iterator_residual_last.h": {
+      "sha256": "a1ce08a5b56c99baf2d3c5826020c5ad1439e83a6d16a525db558739fcff6a37",
+      "bytes": 64473,
+      "upstream": "cutlass-0b55a2f691d69981583568fd9eb69687b1f0de8a/examples/41_fused_multi_head_attention/iterators/predicated_tile_access_iterator_residual_last.h"
+    },
+    "iterators/predicated_tile_iterator_residual_last.h": {
+      "sha256": "a02cb8cd5756d9dd8bfc1bfcab07e3a910e24398cfd7297f5d513dfd2e59aa07",
+      "bytes": 64508,
+      "upstream": "cutlass-0b55a2f691d69981583568fd9eb69687b1f0de8a/examples/41_fused_multi_head_attention/iterators/predicated_tile_iterator_residual_last.h"
+    },
+    "iterators/transpose_warp_iterator.h": {
+      "sha256": "5d189da50be1ef5b4194287bcd2ede37bb8c94752db664fa53fc3dd9c52efb7d",
+      "bytes": 2512,
+      "upstream": "cutlass-0b55a2f691d69981583568fd9eb69687b1f0de8a/examples/41_fused_multi_head_attention/iterators/transpose_warp_iterator.h"
+    },
+    "iterators/warp_iterator_from_smem.h": {
+      "sha256": "4a95172eb033da218c5f80d7d1e4c5041f8823f14c400bd86825f524a22e3372",
+      "bytes": 10063,
+      "upstream": "cutlass-0b55a2f691d69981583568fd9eb69687b1f0de8a/examples/41_fused_multi_head_attention/iterators/warp_iterator_from_smem.h"
+    },
+    "kernel_forward.h": {
+      "sha256": "ed88c8932b43c4455d9ba2a9474da6984fa4ab7a87c21a5805cfe3a70c6a128c",
+      "bytes": 52618,
+      "upstream": "cutlass-0b55a2f691d69981583568fd9eb69687b1f0de8a/examples/41_fused_multi_head_attention/kernel_forward.h"
+    },
+    "transform/tile_smem_loader.h": {
+      "sha256": "b450976aba61509561d27819be5123d4449ae97b140387879f5128f2e1b83c39",
+      "bytes": 3761,
+      "upstream": "cutlass-0b55a2f691d69981583568fd9eb69687b1f0de8a/examples/41_fused_multi_head_attention/transform/tile_smem_loader.h"
+    }
+  }
+}

@@ -39,8 +39,20 @@ template<int Threads>__device__ __forceinline__ void load_half(const __half *x,_
         }
     }
 }
-template<int Groups>__device__ void score_tile(Keys64QueryTile<Groups> &t,int warp){
-    if(warp>=(Keys/16)*Groups)return;
+template<int Threads>__device__ __forceinline__ void load_q8(const unsigned char *x,__half *tile,int first,int head,int heads,int valid){
+    constexpr int Count=Keys*Dim;
+    for(int i=threadIdx.x;i<Count;i+=Threads){
+        const int token=first+i/Dim,d=i%Dim;
+        __half v=__float2half(0);
+        if(token<valid){
+            const auto *p=x+(size_t(token)*heads+head)*272+(d/32)*34;
+            v=__float2half_rn(__fmul_rn(__half2float(*reinterpret_cast<const __half *>(p)),
+                                       float(reinterpret_cast<const signed char *>(p+2)[d%32])));
+        }
+        tile[(i/Dim)*Pitch+d]=v;
+    }
+}
+template<int Groups>__device__ void score_tile(Keys64QueryTile<Groups> &t,int warp){    if(warp>=(Keys/16)*Groups)return;
     const int query=warp/(Keys/16),key=warp%(Keys/16);
     wmma::fragment<wmma::accumulator,16,16,16,float> dots;wmma::fill_fragment(dots,0.f);
     #pragma unroll
@@ -53,7 +65,7 @@ template<int Groups>__device__ void score_tile(Keys64QueryTile<Groups> &t,int wa
     }
     wmma::store_matrix_sync(t.score+query*16*ScorePitch+key*16,dots,ScorePitch,wmma::mem_row_major);
 }
-template<int Groups>__global__ void keys64_kernel(const float *query,const __half *key,const __half *value,
+template<int Groups,bool Q8>__global__ void keys64_kernel(const float *query,const void *key,const void *value,
                                          float *out,PrefillAttentionShape s){
     constexpr int Rows=16*Groups,Threads=128*Groups,Warps=4*Groups;
     extern __shared__ __align__(32) unsigned char arena[];
@@ -84,7 +96,9 @@ template<int Groups>__global__ void keys64_kernel(const float *query,const __hal
     for(int f=0;f<4;++f){wmma::fill_fragment(result[f],0.f);wmma::fill_fragment(history[f],0.f);}
     __syncthreads();
     for(int first=0;first<end;first+=Keys){
-        load_half<Threads>(key,t.kv,first,kh,s.kv_heads,s.valid);__syncthreads();
+        if constexpr(Q8)load_q8<Threads>(static_cast<const unsigned char *>(key),t.kv,first,kh,s.kv_heads,s.valid);
+        else load_half<Threads>(static_cast<const __half *>(key),t.kv,first,kh,s.kv_heads,s.valid);
+        __syncthreads();
         score_tile(t,warp);__syncthreads();
         for(int row=warp;row<Rows;row+=Warps){
             const int token0=first+lane,token1=token0+32,boundary=s.query_start+first_query+row;
@@ -110,7 +124,9 @@ template<int Groups>__global__ void keys64_kernel(const float *query,const __hal
             #pragma unroll
             for(int f=0;f<4;++f)result[f].x[i]*=adjust;
         }
-        load_half<Threads>(value,t.kv,first,kh,s.kv_heads,s.valid);__syncthreads();
+        if constexpr(Q8)load_q8<Threads>(static_cast<const unsigned char *>(value),t.kv,first,kh,s.kv_heads,s.valid);
+        else load_half<Threads>(static_cast<const __half *>(value),t.kv,first,kh,s.kv_heads,s.valid);
+        __syncthreads();
         #pragma unroll
         for(int offset=0;offset<Keys;offset+=16){
             #pragma unroll
@@ -172,24 +188,24 @@ template<int Groups>__global__ void keys64_kernel(const float *query,const __hal
         __syncthreads();
     }
 }
-template<int Groups>void configure(){
+template<int Groups,bool Q8>void configure(){
     const int bytes=int(sizeof(Keys64QueryTile<Groups>));int device=0;check_cuda(cudaGetDevice(&device),"keys64 online PP setup device");
     if(capabilities(device).shared_per_block<size_t(bytes))throw std::runtime_error("keys64 online PP exceeds shared capacity");
-    check_cuda(cudaFuncSetAttribute(keys64_kernel<Groups>,cudaFuncAttributeMaxDynamicSharedMemorySize,bytes),"keys64 online PP shared reservation");
-    check_cuda(cudaFuncSetAttribute(keys64_kernel<Groups>,cudaFuncAttributePreferredSharedMemoryCarveout,100),"keys64 online PP shared partition");
+    check_cuda(cudaFuncSetAttribute(keys64_kernel<Groups,Q8>,cudaFuncAttributeMaxDynamicSharedMemorySize,bytes),"keys64 online PP shared reservation");
+    check_cuda(cudaFuncSetAttribute(keys64_kernel<Groups,Q8>,cudaFuncAttributePreferredSharedMemoryCarveout,100),"keys64 online PP shared partition");
 }
-template<int Groups>void launch(const float *q,const __half *k,const __half *v,float *out,PrefillAttentionShape s,cudaStream_t stream){
-    keys64_kernel<Groups><<<dim3(s.query_heads,(s.tokens+16*Groups-1)/(16*Groups)),128*Groups,sizeof(Keys64QueryTile<Groups>),stream>>>(q,k,v,out,s);
+template<int Groups,bool Q8>void launch(const float *q,const void *k,const void *v,float *out,PrefillAttentionShape s,cudaStream_t stream){
+    keys64_kernel<Groups,Q8><<<dim3(s.query_heads,(s.tokens+16*Groups-1)/(16*Groups)),128*Groups,sizeof(Keys64QueryTile<Groups>),stream>>>(q,k,v,out,s);
 }
-template<int Groups>PrefillOnlineResources resources(){
+template<int Groups,bool Q8>PrefillOnlineResources resources(){
     cudaFuncAttributes a{};int blocks=0;
-    check_cuda(cudaFuncGetAttributes(&a,keys64_kernel<Groups>),"keys64 online PP resources");
-    check_cuda(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks,keys64_kernel<Groups>,128*Groups,sizeof(Keys64QueryTile<Groups>)),"keys64 online PP occupancy bound");
+    check_cuda(cudaFuncGetAttributes(&a,keys64_kernel<Groups,Q8>),"keys64 online PP resources");
+    check_cuda(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks,keys64_kernel<Groups,Q8>,128*Groups,sizeof(Keys64QueryTile<Groups>)),"keys64 online PP occupancy bound");
     return {a.numRegs,blocks,a.maxThreadsPerBlock,a.localSizeBytes,sizeof(Keys64QueryTile<Groups>)};
 }
 }
 PrefillOnlineResources prefill_keys64_resources(int rows){
-    if(rows==16)return resources<1>();if(rows==32)return resources<2>();if(rows==48)return resources<3>();
+    if(rows==16)return resources<1,false>();if(rows==32)return resources<2,false>();if(rows==48)return resources<3,false>();
     throw std::invalid_argument("unsupported PP query tile");
 }
 size_t prefill_keys64_shared_bytes(int rows){
@@ -197,8 +213,22 @@ size_t prefill_keys64_shared_bytes(int rows){
     throw std::invalid_argument("unsupported PP query tile");
 }
 void configure_prefill_keys64(int rows){
-    if(rows==16)configure<1>();else if(rows==32)configure<2>();else if(rows==48)configure<3>();
+    if(rows==16)configure<1,false>();else if(rows==32)configure<2,false>();else if(rows==48)configure<3,false>();
     else throw std::invalid_argument("unsupported PP query tile");
+}
+void configure_prefill_keys64_q8(int rows){
+    if(rows==16)configure<1,true>();else if(rows==32)configure<2,true>();else if(rows==48)configure<3,true>();
+    else throw std::invalid_argument("unsupported PP query tile");
+}
+void prefill_attention_keys64_q8(const float *q,const void *k,const void *v,float *out,
+                            PrefillAttentionShape s,int rows,cudaStream_t stream){
+    prefill_keys64_shared_bytes(rows);
+    if(!q||!out||!s.q8||s.dim!=Dim||s.query_heads<1||s.query_heads>256||s.kv_heads<1||
+       s.query_heads%s.kv_heads||s.tokens<1||s.tokens>8192||s.query_start<0||s.valid!=s.query_start+s.tokens||
+       s.valid>s.capacity||s.capacity>262144||!(s.scale>0)||!std::isfinite(s.scale))
+        throw std::invalid_argument("invalid keys64 Q8 online PP causal geometry");
+    if(rows==16)launch<1,true>(q,k,v,out,s,stream);else if(rows==32)launch<2,true>(q,k,v,out,s,stream);else if(rows==48)launch<3,true>(q,k,v,out,s,stream);
+    check_cuda(cudaGetLastError(),"owned keys64 Q8 online-softmax FP32 PP attention");
 }
 void prefill_attention_keys64(const float *q,const void *k,const void *v,float *out,void *workspace,size_t bytes,
                             PrefillAttentionShape s,int rows,cudaStream_t stream){
@@ -209,7 +239,7 @@ void prefill_attention_keys64(const float *q,const void *k,const void *v,float *
         throw std::invalid_argument("invalid keys64 online PP causal geometry");
     prefill_decode_kv(k,v,workspace,bytes,s,stream);
     auto *key=static_cast<const __half *>(workspace),*value=key+prefill_attention_workspace(s)/(2*sizeof(__half));
-    if(rows==16)launch<1>(q,key,value,out,s,stream);else if(rows==32)launch<2>(q,key,value,out,s,stream);else if(rows==48)launch<3>(q,key,value,out,s,stream);
+    if(rows==16)launch<1,false>(q,key,value,out,s,stream);else if(rows==32)launch<2,false>(q,key,value,out,s,stream);else if(rows==48)launch<3,false>(q,key,value,out,s,stream);
 
     check_cuda(cudaGetLastError(),"owned keys64 online-softmax FP32 PP attention");
 }

@@ -3,7 +3,7 @@
 #include <cstdint>
 
 namespace strata::qwen35moe {
-inline constexpr int kAttentionMaxContext = 196608;
+inline constexpr int kAttentionMaxContext = 262144;
 // Scratch is caller-owned and reused on the model's ordered stream.
 std::size_t flash_attn_tile_scratch_bytes(int max_context);
 void flash_attn_tile_step(const float* q, const uint16_t* k, const uint16_t* v,

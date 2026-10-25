@@ -1,5 +1,8 @@
+#include "resident_kv_policy.hpp"
 #include "strata/qwen35/native/model.hpp"
 #include <algorithm>
+#include "ram_group.hpp"
+#include "ram_group_policy.hpp"
 namespace strata::qwen35::native {
 void DenseModel::reserve_cache(int required,cudaStream_t stream){
     if(required<1||required>limits_.context)throw std::out_of_range("own KV logical context exceeded");
@@ -26,6 +29,16 @@ void DenseModel::reserve_cache(int required,cudaStream_t stream){
         storage_.release(c.key);storage_.release(c.value);c.key=key;c.value=value;
     }
     cache_capacity_=next;
+}
+void DenseModel::reserve_fresh_cache(int required,cudaStream_t stream){
+    if(required<1||required>limits_.context)throw std::out_of_range("fresh KV logical context exceeded");
+    ram_group_last()={};
+    if(!limits_.kv_ram_tokens){reserve_cache(required,stream);return;}
+    std::vector<RamKvCache*> group;for(auto &c:caches_)if(c.ram)group.push_back(c.ram.get());
+    auto bind=[&](){for(auto &c:caches_)if(c.ram){c.key=c.ram->view().key;c.value=c.ram->view().value;}};
+    try{reserve_ram_group(group,required,stream,use_parallel_ram_group(required,group),resident_kv_requested(required,limits_.kv_ram_tokens));}
+    catch(...){bind();throw;}
+    bind();
 }
 int DenseModel::cache_logical_capacity()const{
     if(!limits_.kv_ram_tokens)return cache_capacity_;

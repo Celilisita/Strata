@@ -79,6 +79,20 @@ JOYAI_PATTERN = (
 )
 
 
+# GLM4 byte-level BPE pre-tokenizer: canonical llama-vocab.cpp,
+# LLAMA_VOCAB_PRE_TYPE_CHATGLM4. Its digit groups and combining-mark
+# handling differ from qwen35; keep the model-declared rule separate.
+GLM4_PATTERN = (
+    r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])"
+    r"|[^\r\n\p{L}\p{N}]?\p{L}+"
+    r"|\p{N}{1,3}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
+
+
 class Tokenizer:
     def __init__(self, tokens: list[str], merges: list[str], token_types: list[int] | None = None,
                  pre: str = "qwen35", special_ids: dict[str, int] | None = None):
@@ -101,7 +115,7 @@ class Tokenizer:
             if parts[0] not in self.ids or parts[1] not in self.ids:
                 raise ValueError("merge %d names a token outside the vocabulary: %r" % (i, m))
             self.ranks[(parts[0], parts[1])] = i
-        patterns = {"qwen35": QWEN35_PATTERN, "joyai-llm": JOYAI_PATTERN}
+        patterns = {"qwen35": QWEN35_PATTERN, "joyai-llm": JOYAI_PATTERN, "glm4": GLM4_PATTERN}
         if pre not in patterns:
             raise ValueError(f"unsupported GGUF pre-tokenizer {pre!r}")
         self._re = regex.compile(patterns[pre])
@@ -238,7 +252,10 @@ class Tokenizer:
             if got is None:
                 mapped = "".join(BYTE_TO_UNICODE[b] for b in piece.encode("utf-8"))
                 got = []
-                for tok in self._bpe(mapped):
+                # glm4 declares ignore_merges: preserve a complete known word
+                # before falling back to the unchanged ranked BPE merge path.
+                pieces = [mapped] if self.pre == "glm4" and mapped in self.ids else self._bpe(mapped)
+                for tok in pieces:
                     i = self.ids.get(tok)
                     if i is None:
                         raise KeyError("BPE produced a token outside the vocabulary: %r" % tok)
@@ -324,6 +341,10 @@ def extract(gguf_path, out_dir) -> dict:
         "pre_pattern": QWEN35_PATTERN,
         "pre_pattern_source": ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)",
     }
+    if tk.pre == "glm4":
+        cfg["pre_pattern"] = GLM4_PATTERN
+        cfg["pre_pattern_source"] = "third_party/canonical/src/llama-vocab.cpp LLAMA_VOCAB_PRE_TYPE_CHATGLM4"
+        cfg["ignore_merges"] = True
     (out / "vocab.json").write_text(json.dumps(tk.ids, ensure_ascii=False), encoding="utf-8")
     (out / "merges.txt").write_text("\n".join("%s %s" % k for k, _ in
                                               sorted(tk.ranks.items(), key=lambda kv: kv[1])), encoding="utf-8")

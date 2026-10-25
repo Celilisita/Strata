@@ -50,21 +50,21 @@ template<bool Pair,int Tokens> void launch(Matrix a,Matrix b,const void *input,f
 }
 void validate(Matrix m,const void *x,const float *out,int tokens){
     matrix_bytes(m);
-    if(!x||!out||(m.quant==Quant::Q4K&&reinterpret_cast<uintptr_t>(m.data)%4)||(tokens!=2&&tokens!=3)||(m.layout!=BlockLayout::Gguf&&m.layout!=BlockLayout::Q4Pairs))
+    if(!x||!out||(m.quant==Quant::Q4K&&reinterpret_cast<uintptr_t>(m.data)%4)||(tokens<2||tokens>4)||(m.layout!=BlockLayout::Gguf&&m.layout!=BlockLayout::Q4Pairs))
         throw std::invalid_argument("invalid own tiny-batch matrix lease");
 }
 }
 void tiny_meta_linear(Matrix m,const void *x,float *out,int tokens,cudaStream_t s){
     if(m.quant!=Quant::Q4K){tiny_batch_linear(m,x,out,tokens,s);return;}
     validate(m,x,out,tokens);
-    if(tokens==2)launch<false,2>(m,m,x,out,nullptr,nullptr,s);else launch<false,3>(m,m,x,out,nullptr,nullptr,s);
+    if(tokens==2)launch<false,2>(m,m,x,out,nullptr,nullptr,s);else if(tokens==3)launch<false,3>(m,m,x,out,nullptr,nullptr,s);else launch<false,4>(m,m,x,out,nullptr,nullptr,s);
     check_cuda(cudaGetLastError(),"own tiny batch projection");
 }
 void tiny_meta_pair(Matrix a,Matrix b,const void *x,float *first,float *second,float *act,int tokens,cudaStream_t s){
     if(a.quant!=Quant::Q4K){tiny_batch_pair(a,b,x,first,second,act,tokens,s);return;}
     validate(a,x,first,tokens);validate(b,x,second,tokens);
     if(!act||a.quant!=b.quant||a.layout!=b.layout||a.rows!=b.rows||a.columns!=b.columns)throw std::invalid_argument("invalid tiny pair");
-    if(tokens==2)launch<true,2>(a,b,x,first,second,act,s);else launch<true,3>(a,b,x,first,second,act,s);
+    if(tokens==2)launch<true,2>(a,b,x,first,second,act,s);else if(tokens==3)launch<true,3>(a,b,x,first,second,act,s);else launch<true,4>(a,b,x,first,second,act,s);
     check_cuda(cudaGetLastError(),"own tiny batch fused pair");
 }
 }

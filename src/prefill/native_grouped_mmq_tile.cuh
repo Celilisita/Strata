@@ -1,6 +1,9 @@
 // Canonical pinned MMQ tile loader/product/writeback; only matrix address and
 // route-row scheduling differ. No expert-weight gathering or F16 mirror.
+#include "strata/prefill/native_code_sum_support.hpp"
 namespace strata::prefill::mmq {
+void native_grouped_canonical(int, const NativeMmqMatrix*, int, int, const int32_t*, const void*, float*,
+    int, int, int, int, void*, const NativeMmqTile*, int, const NativeMmqEncodedInput*);
 namespace {
 template<ggml_type Type, int J, bool Active>
 __launch_bounds__(ggml_cuda_mmq_get_nthreads(Type, J, false STRATA_NATIVE_MMQ_Q8),
@@ -9,6 +12,12 @@ __global__ void native_grouped_mmq_tile(const NativeMmqMatrix* matrices,
     const int32_t* output_ids, const int* packed, float* output,
     int rows, int cols, int outputs, const NativeMmqTile* tiles) {
     constexpr auto type = Type;
+#if __CUDA_ARCH__ == 700 || __CUDA_ARCH__ == 750
+    constexpr auto config = ggml_cuda_mmq_get_config(type, J, false STRATA_NATIVE_MMQ_Q8);
+    static_assert(!config.use_mma_data_layout() && config.I == native_code_sum_tile_rows &&
+        config.nthreads == native_code_sum_threads && config.occupancy == 1 &&
+        config.K_vram == native_code_sum_k, "private grouped host/device DP4A contract");
+#endif
     constexpr int I = ggml_cuda_mmq_get_I(type, J, false STRATA_NATIVE_MMQ_Q8);
     constexpr int warps = ggml_cuda_mmq_get_nthreads(type, J, false STRATA_NATIVE_MMQ_Q8) / 32;
     const auto tile = Active ? tiles[blockIdx.y] : NativeMmqTile{int(blockIdx.z), int(blockIdx.y)};
@@ -35,7 +44,7 @@ __global__ void native_grouped_mmq_tile(const NativeMmqMatrix* matrices,
 template<ggml_type Type>
 void launch_native_grouped_mmq(const NativeMmqMatrix* matrices, int groups, int parts,
     const int32_t* output_ids, const void* packed, float* output,
-    int rows, int max_rows, int cols, int outputs, void* stream, const NativeMmqTile* tiles, int tile_count) {
+    int rows, int max_rows, int cols, int outputs, void* stream, const NativeMmqTile* tiles, int tile_count, const NativeMmqEncodedInput* encoded) {
     if ((parts != 1 && parts != 2) || !matrices || !output_ids || !packed || !output || !stream || groups < 1 || groups > 256 ||
         rows < 1 || rows > 65536 || max_rows < 1 || max_rows > 8192 || max_rows > rows ||
         cols < 512 || cols % 512 || outputs < 128 || outputs % 128)
@@ -43,9 +52,14 @@ void launch_native_grouped_mmq(const NativeMmqMatrix* matrices, int groups, int 
     if ((tiles && (tile_count < 1 || tile_count > 1280)) || (!tiles && tile_count))
         throw std::invalid_argument("invalid bounded active MMQ tiles");
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    if (ggml_cuda_highest_compiled_arch(cc) != GGML_CUDA_CC_VOLTA)
-        throw std::runtime_error("grouped exact-code-sum MMQ requires measured Volta DP4A");
-    constexpr int J = 64;
+    const int compiled = ggml_cuda_highest_compiled_arch(cc);
+    if (compiled == 1200) {
+        native_grouped_canonical(Type,matrices,groups,parts,output_ids,packed,output,rows,max_rows,cols,outputs,stream,tiles,tile_count,encoded);
+        return;
+    }
+    if (!native_code_sum_grouped_supported(int(Type), cols, outputs))
+        throw std::runtime_error("unsupported private DP4A grouped MMQ device/shape");
+    constexpr int J = native_code_sum_group_columns;
     const auto config = ggml_cuda_mmq_get_config(Type, J, false, cc STRATA_NATIVE_MMQ_Q8);
     const int shared = int(mmq_get_nbytes_shared(config, cc));
     if (tiles) {
@@ -65,13 +79,20 @@ void launch_native_grouped_mmq(const NativeMmqMatrix* matrices, int groups, int 
 }
 void native_grouped_mmq(int type, const NativeMmqMatrix* matrices, int groups, int parts,
     const int32_t* output_ids, const void* packed, float* output,
-    int rows, int max_rows, int cols, int outputs, void* stream, const NativeMmqTile* tiles, int tile_count) {
+    int rows, int max_rows, int cols, int outputs, void* stream, const NativeMmqTile* tiles, int tile_count, const NativeMmqEncodedInput* encoded) {
+    // Q5 is routed directly to the explicit SM120 FP8 provider, never the
+    // legacy Volta template or an implicit PackedQ6 canonical fallback.
+    if (type == GGML_TYPE_Q5_K) {
+        native_grouped_canonical(type,matrices,groups,parts,output_ids,packed,output,
+            rows,max_rows,cols,outputs,stream,tiles,tile_count,encoded);
+        return;
+    }
     if (type == GGML_TYPE_Q4_K)
         launch_native_grouped_mmq<GGML_TYPE_Q4_K>(matrices, groups, parts, output_ids, packed, output,
-            rows, max_rows, cols, outputs, stream, tiles, tile_count);
+            rows, max_rows, cols, outputs, stream, tiles, tile_count, encoded);
     else if (type == GGML_TYPE_Q6_K)
         launch_native_grouped_mmq<GGML_TYPE_Q6_K>(matrices, groups, parts, output_ids, packed, output,
-            rows, max_rows, cols, outputs, stream, tiles, tile_count);
+            rows, max_rows, cols, outputs, stream, tiles, tile_count, encoded);
     else throw std::invalid_argument("unsupported grouped native MMQ quantization");
 }
 } // namespace strata::prefill::mmq

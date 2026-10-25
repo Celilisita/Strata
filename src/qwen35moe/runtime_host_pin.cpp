@@ -57,8 +57,8 @@ void Runtime::pin_expert_weights(int count) {
         : (std::max)(uint64_t(8) << 30, memory.total / 4);
     for (int il = 0; il < count; ++il) {
         const auto& source = expert_sources_[size_t(il)];
-        const size_t gu = kernels::native_mmvq_weight_bytes(12, 2048, 512);
-        const size_t down = kernels::native_mmvq_weight_bytes(
+        const size_t gu = nvfp4_?Nvfp4ExpertInventory::matrix_bytes:kernels::native_mmvq_weight_bytes(12, 2048, 512);
+        const size_t down = nvfp4_?Nvfp4ExpertInventory::matrix_bytes:kernels::native_mmvq_weight_bytes(
             int(source.down_exps->type), 512, 2048);
         const size_t stride = (2 * gu + down + 255) & ~size_t(255);
         const size_t bytes = size_t(256) * stride;
@@ -89,4 +89,35 @@ void Runtime::pin_expert_weights(int count) {
     }
 }
 
+void Runtime::prepare_host_readonly() {
+    const char* setting=std::getenv("STRATA_QWEN35_PP_REGISTER_MIB");
+    if(!setting || !std::strcmp(setting,"0")) return;
+    size_t used=0;const auto mib=std::stoull(setting,&used);
+    if(setting[used] || !mib || mib>16384) throw std::invalid_argument("GGUF page lease limit0..16384MiB");
+    if(pinned_experts_.bytes)
+        throw std::invalid_argument("GGUF page lease conflicts with copied/per-layer pinning");
+    const size_t bound=size_t(mib)<<20;
+    std::vector<HostReadOnlyLease::Span> spans;
+    size_t planned=0;
+    const size_t experts=size_t(spec_.n_expert);
+    if (!experts) throw std::invalid_argument("empty native expert inventory");
+    // First full warm layers need no PP H2D, so leave their original pages pageable.
+    for(size_t il=expert_cache_.slots/experts;il<expert_sources_.size();++il) {
+        const auto& source=expert_sources_[il];
+        const size_t gu=nvfp4_?Nvfp4ExpertInventory::matrix_bytes:kernels::native_mmvq_weight_bytes(int(source.gate_exps->type),int(spec_.n_embd),int(spec_.n_ff_exp));
+        const size_t down=nvfp4_?Nvfp4ExpertInventory::matrix_bytes:kernels::native_mmvq_weight_bytes(int(source.down_exps->type),int(spec_.n_ff_exp),int(spec_.n_embd));
+        const uint8_t* data[]{gguf_.tensor_data(*source.gate_exps),gguf_.tensor_data(*source.up_exps),gguf_.tensor_data(*source.down_exps)};
+        const size_t sizes[]{gu*experts,gu*experts,down*experts};
+        HostReadOnlyLease::Span layer[3];size_t layer_bytes=0;
+        for(int i=0;i<3;++i) {
+            const auto begin=reinterpret_cast<uintptr_t>(data[i]);
+            layer[i]={begin&~uintptr_t(4095),(begin+sizes[i]+4095)&~uintptr_t(4095)};
+            layer_bytes+=layer[i].second-layer[i].first;
+        }
+        if(planned+layer_bytes>bound) break;
+        spans.insert(spans.end(),std::begin(layer),std::end(layer));planned+=layer_bytes;
+    }
+    if (spans.empty()) return; // The GPU already holds every useful source layer.
+    host_readonly_.prepare(std::move(spans),bound,[] { return host_memory().available; },prefill_config_.mapped_pp);
+}
 } // namespace strata::qwen35moe

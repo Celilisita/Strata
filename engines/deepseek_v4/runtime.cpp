@@ -1,10 +1,17 @@
 #include "runtime.hpp"
+#include "../glm5_next/model_contract.hpp"
+#include "../glm5_next/mtp_options.hpp"
+#include "../glm5_next/verify4_options.hpp"
+#include "../glm5_next/mtp_session.hpp"
+#include "../glm5_next/cpu_placement.hpp"
 #include "runtime_memory.hpp"
 #include "mtp_sidecar.hpp"
 #include "mtp_drafter.hpp"
 #include "native_tg_graph.hpp"
 #include "llama-model.h"
 #include "llama-context.h"
+#include "llama-moe-cache.h"
+#include "pp_stream_graph.hpp"
 #include "device_cache.hpp"
 #include "cache_leaf_aliases.hpp"
 #include "expert_staging_attach.hpp"
@@ -37,6 +44,7 @@ constexpr const char* routed_experts = "blk\\.[0-9]+\\.ffn_(gate|up|down|gate_up
 
 struct ExpertWarmPlan {std::vector<ExpertWarmRange> read,lock;};
 ExpertWarmPlan expert_warm_plan(const llama_model& model,uint64_t source_budget){
+    if(model.arch==LLM_ARCH_GLM5_NEXT)return strata::glm5_next::warm_plan<ExpertWarmPlan>(model);
     const char* priority=std::getenv("STRATA_DSV4_MTP_PIN_PRIORITY");
     const bool mtp_first=model.layers.size()==44&&priority&&!std::strcmp(priority,"1");
     const uint64_t original_budget=source_budget;
@@ -79,18 +87,14 @@ bool check_architecture(const std::string& path, std::string& error) {
     }
     const int64_t key = gguf_find_key(header.get(), "general.architecture");
     if (key < 0 || gguf_get_kv_type(header.get(), key) != GGUF_TYPE_STRING ||
-        std::strcmp(gguf_get_val_str(header.get(), key), "deepseek4") != 0) {
-        error = "the model GGUF must declare general.architecture=deepseek4";
+        !strata::glm5_next::accepted_architecture(gguf_get_val_str(header.get(), key))) {
+        error = "GGUF architecture must be deepseek4 or glm5-next; GLM requires the matched Shard_Rewrite metadata";
         return false;
     }
     return true;
 }
 
-struct BatchOwner {
-    llama_batch value;
-    explicit BatchOwner(int32_t count) : value(llama_batch_init(count, 0, 1)) {}
-    ~BatchOwner() { llama_batch_free(value); }
-};
+
 
 }  // namespace
 
@@ -159,19 +163,21 @@ bool Runtime::initialize(std::string& error, ggml_backend_sched_eval_callback ca
     model_params.load_mode = LLAMA_LOAD_MODE_MMAP;
     model_params.lazy_mode = LLAMA_LAZY_MODE_ON;
     model_params.use_extra_bufts = false;
-    model_params.load_mtp = false;
+    model_params.load_mtp = strata::glm5_next::mtp_requested();
     runtime_memory("before-model-load");
-    model_ = llama_model_load_from_file(options_.model.c_str(), model_params);
+    model_ = strata::glm5_next::load(options_.model, model_params);
     runtime_memory("after-model-load");
     if (!model_) {
         error = "canonical DeepSeek4 model loading failed";
         return false;
     }
-    if (metadata("general.architecture") != "deepseek4") {
+    if (!strata::glm5_next::accepted_architecture(metadata("general.architecture").c_str())) {
         error = "loaded model architecture differs from the validated GGUF";
         return false;
     }
+    if (!strata::glm5_next::validate(*model_, error)) return false;
     vocab_ = llama_model_get_vocab(model_);
+    glm_mtp_=model_->arch==LLM_ARCH_GLM5_NEXT&&strata::glm5_next::mtp_requested();
     if(const char* path=std::getenv("STRATA_DSV4_MTP_PATH")) {
         if(!device_expert_cache_requested()||!native_tg_cpu_only())throw std::runtime_error("MTP requires native CPU miss service and unified device cache");
         mtp_loading_backend_=ggml_backend_dev_init(devices_[0],nullptr);if(!mtp_loading_backend_)throw std::runtime_error("MTP weight backend initialization failed");
@@ -202,12 +208,17 @@ bool Runtime::initialize_context(std::string& error, ggml_backend_sched_eval_cal
     context_params.n_batch = options_.n_batch;
     context_params.n_ubatch = options_.n_ubatch;
     context_params.n_seq_max = 1;
-    if(mtp_enabled())context_params.n_rs_seq=2;
+    glm_verify4_probe_=glm_mtp_&&strata::glm5_next::verify4_probe_requested();
+    if(mtp_enabled()||glm_mtp_)context_params.n_rs_seq=2;
+    if(glm_mtp_)context_params.n_outputs_max_per_seq=2;
+    if(glm_verify4_probe_) {context_params.n_rs_seq=3;context_params.n_outputs_max_per_seq=4;}
     // This driver requests at most the final token's logits in any decode
     // batch. Bound worst-case head/output reservation to that same contract.
-    if (last_logit_only) context_params.n_outputs_max = mtp_enabled() ? 2 : 1;
-    context_params.n_threads = options_.n_threads;
-    context_params.n_threads_batch = options_.n_threads;
+    if (last_logit_only) context_params.n_outputs_max = (mtp_enabled()||glm_mtp_) ? 2 : 1;
+    if (last_logit_only&&glm_verify4_probe_) context_params.n_outputs_max=4;
+    const int support_threads=model_->arch==LLM_ARCH_GLM5_NEXT&&strata::glm5_next::single_ccd_requested()?1:options_.n_threads;
+    context_params.n_threads = support_threads;
+    context_params.n_threads_batch = support_threads;
     // NextN metadata may remain; this context never builds or executes MTP.
     context_params.ctx_type = LLAMA_CONTEXT_TYPE_DEFAULT;
     const ggml_type kv_type = options_.kv_type == "q8_0" ? GGML_TYPE_Q8_0 : GGML_TYPE_F16;
@@ -217,7 +228,10 @@ bool Runtime::initialize_context(std::string& error, ggml_backend_sched_eval_cal
     // raw SWA cache is ringed; the logical context remains options_.n_ctx.
     context_params.swa_full = options_.kv_resident == 0;
     context_params.dsv4_raw_kv_resident = options_.kv_resident;
-    context_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    context_params.flash_attn_type = options_.flash_attn == "on" ? LLAMA_FLASH_ATTN_TYPE_ENABLED :
+        options_.flash_attn == "off" ? LLAMA_FLASH_ATTN_TYPE_DISABLED :
+        options_.flash_attn == "auto" ? LLAMA_FLASH_ATTN_TYPE_AUTO :
+        model_->arch == LLM_ARCH_GLM5_NEXT ? LLAMA_FLASH_ATTN_TYPE_DISABLED : LLAMA_FLASH_ATTN_TYPE_ENABLED;
     context_params.moe_cache_size = size_t(options_.moe_cache_mib) * 1024 * 1024;
     context_params.offload_kqv = true;
     context_params.op_offload = true;
@@ -231,10 +245,12 @@ bool Runtime::initialize_context(std::string& error, ggml_backend_sched_eval_cal
         error = "canonical DeepSeek4 context initialization failed";
         return false;
     }
+    if(glm_mtp_)context_->set_embeddings_nextn(true,false);
     if(mtp_enabled()){std::cerr<<"strata_mtp_stage=context_reserved\n"<<std::flush;llama_synchronize(context_);}
-    // Prefill and decode use the same configured thread count and owned pool.
-    // Canonical defaults preserve affinity, priority and polling policy.
-    auto pool_params = ggml_threadpool_params_default(options_.n_threads);
+    // GLM's full CCD belongs to the expert service. Small context/NextN CPU
+    // operations share the submitting thread instead of another spinning team.
+    auto pool_params = ggml_threadpool_params_default(support_threads);
+    if(model_->arch==LLM_ARCH_GLM5_NEXT&&strata::glm5_next::single_ccd_requested())pool_params.poll=0;
     threadpool_ = ggml_threadpool_new(&pool_params);
     if (!threadpool_) {
         error = "canonical resident CPU threadpool initialization failed";
@@ -272,6 +288,7 @@ bool Runtime::reconfigure_context(const Options& options, std::string& error,
         error = "context reuse cannot change model/device/dense placement/image source";
         return false;
     }
+    glm_session_.reset();
     mtp_drafter_.reset();
     if (context_) {
         llama_detach_threadpool(context_);
@@ -286,6 +303,7 @@ bool Runtime::reconfigure_context(const Options& options, std::string& error,
 }
 
 Runtime::~Runtime() {
+    glm_session_.reset();
     mtp_drafter_.reset();
     if (context_) {
         llama_detach_threadpool(context_);
@@ -349,61 +367,6 @@ std::string Runtime::detokenize(const std::vector<llama_token>& tokens, bool spe
     return result;
 }
 
-int Runtime::decode_tokens(const llama_token* tokens, size_t count, llama_pos start_pos,
-                          bool logits_last, std::string& error,bool all_logits) {
-    error.clear();
-    if (!context_ || !tokens || count == 0 || count > llama_n_batch(context_) || start_pos < 0 ||
-        uint64_t(start_pos) + count > llama_n_ctx(context_)) {
-        error = "token batch exceeds context/batch bounds or has invalid input";
-        return -1;
-    }
-    BatchOwner batch{int32_t(count)};
-    if (!batch.value.token || !batch.value.pos || !batch.value.seq_id || !batch.value.logits) {
-        error = "could not allocate token batch";
-        return -1;
-    }
-    batch.value.n_tokens = int32_t(count);
-    for (size_t index = 0; index < count; ++index) {
-        if (tokens[index] < 0 || tokens[index] >= llama_vocab_n_tokens(vocab_)) {
-            error = "token ID lies outside the model vocabulary";
-            return -1;
-        }
-        batch.value.token[index] = tokens[index];
-        batch.value.pos[index] = start_pos + llama_pos(index);
-        batch.value.n_seq_id[index] = 1;
-        batch.value.seq_id[index][0] = 0;
-        batch.value.logits[index] = int8_t(all_logits || (logits_last && index + 1 == count));
-    }
-    prepare_device_expert_cache(context_, count);
-    const int status = llama_decode(context_, batch.value);
-    if (status != 0) {
-        error = "canonical decode returned status " + std::to_string(status);
-        return status;
-    }
-    position_ = start_pos + llama_pos(count);
-    return 0;
-}
-
-bool Runtime::evaluate(const std::vector<llama_token>& tokens, std::string& error, const std::atomic<bool>* cancel) {
-    error.clear();
-    if (tokens.empty()) {
-        error = "empty input token sequence";
-        return false;
-    }
-    if (uint64_t(position_) + tokens.size() > llama_n_ctx(context_)) {
-        error = "input token sequence exceeds available context";
-        return false;
-    }
-    for (size_t offset = 0; offset < tokens.size();) {
-        if(cancel&&cancel->load()){error="request cancelled";return false;}
-        const size_t count = std::min(size_t(llama_n_batch(context_)), tokens.size() - offset);
-        const bool last = offset + count == tokens.size();
-        if (decode_tokens(tokens.data() + offset, count, position_, last, error) != 0) return false;
-        offset += count;
-    }
-    return true;
-}
-
 llama_token Runtime::greedy(bool ignore_eog) const {
     return greedy_at(-1,ignore_eog);
 }
@@ -429,8 +392,12 @@ llama_token Runtime::greedy_at(int output_index,bool ignore_eog) const {
 bool Runtime::is_eog(llama_token token) const noexcept { return llama_vocab_is_eog(vocab_, token); }
 
 void Runtime::reset(bool clear_data) {
+    glm_catchup_pending_=false;
+    if(glm_session_)glm_session_->reset();
+    glm_prefix_hidden_.clear();glm_latest_hidden_.clear();glm_collect_prefix_=true;
     if(mtp_drafter_)mtp_drafter_->reset();
     if(mtp_enabled())context_->strata_capture_nextn_tail(128);
+    if(model_->arch==LLM_ARCH_GLM5_NEXT && pp_stream_enabled(true))context_->strata_moe_cache()->strata_clear_glm_prefill();
     llama_memory_clear(llama_get_memory(context_), clear_data);
     llama_perf_context_reset(context_);
     position_ = 0;

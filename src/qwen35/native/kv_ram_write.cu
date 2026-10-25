@@ -48,6 +48,14 @@ __global__ void reset(RamKvView v){
 void ram_reset(RamKvView v,cudaStream_t s){
     reset<<<(std::max(v.pages,v.slots)*v.heads+255)/256,256,0,s>>>(v);check_cuda(cudaGetLastError(),"RAM cache epoch reset");
 }
+__global__ void invalidate(RamKvView v){
+    const int i=blockIdx.x*256+threadIdx.x;
+    if(i<v.pages*v.heads)v.page_slot[i]=-1;
+    if(i<v.slots*v.heads)v.slot_page[i]=-1;
+}
+void ram_invalidate(RamKvView v,cudaStream_t s){
+    invalidate<<<(std::max(v.pages,v.slots)*v.heads+255)/256,256,0,s>>>(v);check_cuda(cudaGetLastError(),"RAM cache resume invalidation");
+}
 void ram_write(const float *x,RamKvView v,bool key,int dim,int heads,int tokens,const int *positions,int shift,cudaStream_t s){
     if(!x||!positions||dim!=256||heads!=v.heads||tokens<1||tokens>8192)throw std::invalid_argument("invalid RAM KV append");
     write<<<(tokens*heads*8+3)/4,128,0,s>>>(x,key?v.host_key:v.host_value,key?v.key:v.value,v,positions,shift,tokens,key);

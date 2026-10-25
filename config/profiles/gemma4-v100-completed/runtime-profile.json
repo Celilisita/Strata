@@ -1,0 +1,33 @@
+{
+  "family": "gemma4_dense",
+  "variant": "gemma4_31b_completed",
+  "source_target": "strata-gemma-native",
+  "cmake_option": "STRATA_COMPLETED_GEMMA",
+  "default_enabled": false,
+  "context": 262144,
+  "batch": 8192,
+  "slots": 1,
+  "kv_bits": 8,
+  "global_resident_window": 32768,
+  "sampling": {
+    "temperature": 0.6,
+    "top_k": 20,
+    "top_p": 0.95,
+    "min_p": 0
+  },
+  "sampling_provider": "existing strata_native_sampling RadixSampler",
+  "sampled_mtp": "greedy-only optional MTP feature off; ordinary sampled generation",
+  "sampled_graph": "eager decode with advancing request RNG counter",
+  "config_binding_tool": "tools/configure_completed_gemma.py",
+  "server": "serve/server.py --engine strata --config BOUND_CONFIG",
+  "tokenizer": "local tokenizer.json full normalizer/model/decoder, exact GGUF vocabulary binding",
+  "dependencies": [
+    "tokenizers exposing decoders.DecodeStream (verified: 0.22.2)",
+    "jinja2"
+  ],
+  "quality_status": "frozen V100 evidence retained; no new model validation run",
+  "sm120_adaptation_status": "not claimed complete by source integration or compilation",
+  "streaming_decode": "request-owned native DecodeStream; no full output-history redecode fallback",
+  "cancel_release": "single Gemma gate holds through RELEASE; timeout ends the engine and blocks unresolved drain reuse",
+  "response_timeout_s": 900
+}

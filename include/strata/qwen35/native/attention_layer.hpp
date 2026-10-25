@@ -2,9 +2,13 @@
 #include "strata/qwen35/native/recurrent.hpp"
 #include "strata/qwen35/native/attention_prefill.hpp"
 #include "strata/qwen35/native/attention_decode.hpp"
+#include <cstdint>
 
 namespace strata::qwen35::native {
 struct RamKvView;
+struct DraftT1TcStats {bool enabled=false;std::uint64_t owners=0,direct_host_calls=0,selected_host_calls=0,fallback_host_calls=0;};
+// Owner-thread diagnostics count eager/capture enqueues, never Graph executions.
+inline DraftT1TcStats &draft_t1_tc_stats(){static thread_local DraftT1TcStats value;return value;}
 struct AttentionWeights {
     Matrix q,k,v,out,ffn_gate,ffn_up,ffn_down;
     const float *norm,*q_norm,*k_norm,*post_norm;
@@ -21,27 +25,47 @@ using PrefillAttentionKernel=void (*)(const float *,const void *,const void *,fl
                                       PrefillAttentionShape,int,cudaStream_t);
 // Same signature; the integer is KV partitions for this provider.
 using VerifyAttentionKernel=PrefillAttentionKernel;
+// Direct Q8 KV read: no half staging lease, so the borrowed workspace is unused.
+using PrefillAttentionQ8Kernel=void (*)(const float *,const void *,const void *,float *,
+                                       PrefillAttentionShape,int,cudaStream_t);
 // One common weight/staging/activation workspace with recurrent layers.
 // Borrowed objects/cache/stream survive execution; split methods permit a
 // benchmark checkpoint before the FFN overwrites its dead attention scratch.
 class AttentionLayer {
 public:
     AttentionLayer(RecurrentLayer &shared,AttentionWeights,AttentionShape,AttentionSchedule);
+    ~AttentionLayer();
     void rebind(AttentionWeights);
     void visual_positions(const int* table){visual_positions_=table;}
     void attention(const float *hidden,const int *positions,AttentionCache,int tokens,cudaStream_t);
     void cache_only(const float *,const int *,AttentionCache,int,cudaStream_t);
     void finish(const float *hidden,int tokens,cudaStream_t);
     void execute(const float *hidden,const int *positions,AttentionCache c,int tokens,cudaStream_t s){
-        attention(hidden,positions,c,tokens,s);finish(hidden,tokens,s);
+        attention_impl(hidden,positions,c,tokens,s,true);finish(hidden,tokens,s);
     }
     AttentionBuffers buffers(int tokens) const;
     DecodeRounding decode_rounding() const { return schedule_.decode_rounding; }
     void use_pp_attention_gemm(DenseGemm *service){attention_gemm_=service;}
     void use_verify_split(bool enabled){verify_split_=enabled;}
+    // Cold role assignment: only NativeMtp creates a draft owner; main/target defaults false.
+    void use_draft_t1_tc(bool enabled){draft_t1_tc_=enabled;auto &v=draft_t1_tc_stats();v.enabled=enabled;++v.owners;}
     void use_verify_attention_kernel(VerifyAttentionKernel kernel){verify_kernel_=kernel;}
     void use_verify_grid(bool enabled){verify_grid_=enabled;}
     bool verify_grid()const{return verify_grid_;}
+    // Cold fresh-request admission after graph release, before reset/full PP.
+    // The bound includes all lookahead; directory remains identity throughout.
+    void use_ram_request_bound(int bound){
+        if(bound<0||bound>262144)throw std::invalid_argument("RAM request bound");
+        ram_request_bound_=bound;
+    }
+    int ram_request_bound()const{return ram_request_bound_;}
+    // Fresh full prefix only, admitted before directory reset. Decode ignores
+    // this bound because it may later replace pages beyond physical capacity.
+    void use_ram_prefix_bound(int bound){
+        if(bound<0||bound>262144)throw std::invalid_argument("RAM prefix bound");
+        ram_prefix_bound_=bound;
+    }
+    int ram_prefix_bound()const{return ram_prefix_bound_;}
     // Cold benchmark capture; caller owns sufficient query storage to completion.
     void probe_pp_query(float *output){pp_query_probe_=output;}
     // Cold borrowed lease; service/arena survive every queued PP/Graph replay.
@@ -60,8 +84,21 @@ public:
         pp_kernel_=kernel;pp_kernel_rows_=rows;
     }
     bool pp_blocked()const{return blocked_gemm_!=nullptr;}
+    void use_pp_attention_kernel_q8(PrefillAttentionQ8Kernel kernel,int rows=48){
+        if(kernel&&blocked_gemm_)throw std::invalid_argument("multiple PP attention providers");
+        if(rows<16||rows>256||rows%16)throw std::invalid_argument("invalid PP attention query rows");
+        pp_q8_kernel_=kernel;pp_q8_rows_=rows;
+    }
     bool verify_split()const{return verify_split_;}
+    // A fresh request returns the staging lease before any setup allocation so
+    // the configured reserve keeps its full headroom; captured requests never
+    // hold a Graph pointer into it (reusable Graphs are prefix-free 8192 spans).
+    void release_staging();
 private:
+    void attention_impl(const float *,const int *,AttentionCache,int,cudaStream_t,bool closed);
+    // Owned staging for a live KV extent that does not fit the borrowed FFN
+    // arena; grown once per largest request and reused by later ones.
+    void *pp_staging(size_t bytes);
     const int* visual_positions_=nullptr;
     bool verify_split_=false,verify_grid_=false;
     float *pp_query_probe_=nullptr;
@@ -69,7 +106,12 @@ private:
     DenseGemm *blocked_gemm_=nullptr;void *blocked_arena_=nullptr;size_t blocked_bytes_=0;
     int blocked_query_rows_=128,blocked_min_start_=0;
     PrefillAttentionKernel pp_kernel_=nullptr;int pp_kernel_rows_=32;
+    PrefillAttentionQ8Kernel pp_q8_kernel_=nullptr;int pp_q8_rows_=48;
     VerifyAttentionKernel verify_kernel_=nullptr;
     RecurrentLayer &shared_;AttentionWeights weights_;AttentionShape shape_;AttentionSchedule schedule_;
+    int ram_request_bound_=0;
+    int ram_prefix_bound_=0;
+    bool draft_t1_tc_=false;
+    void *pp_stage_=nullptr;size_t pp_stage_bytes_=0;
 };
 }

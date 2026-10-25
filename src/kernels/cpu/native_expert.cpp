@@ -10,6 +10,7 @@
 
 #include "ggml.h"
 #include "ggml-cpu.h"
+#include "nvfp4_cpu.hpp"
 
 #include <cmath>
 #include <cstdlib>
@@ -45,6 +46,8 @@ bool kq256_supported(int type) noexcept { return type == 12 || type == 7 || type
 
 bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err) {
     init_once();
+    if (gu_type == 40 || d_type == 40)
+        return nvfp4_cpu_format(gu_type, d_type, n_embd, n_ff, f, err);
     const ggml_type_traits_cpu* tg = traits(gu_type);
     const ggml_type_traits_cpu* td = traits(d_type);
     if (tg == nullptr || tg->vec_dot == nullptr || td == nullptr || td->vec_dot == nullptr) {

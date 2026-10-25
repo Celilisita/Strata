@@ -159,7 +159,7 @@ __global__ void conv_residual_batch_kernel(const float* history, const float* no
     if (i >= size_t(T) * D) return;
     const int t = int(i / D), c = int(i % D);
     float sum = 0;
-#pragma unroll
+#pragma unroll 1
     for (int k = 0; k < 4; ++k) {
         const int p = t - 9 + 3 * k;             // the token this tap reads (k == 3: this one)
         const float x = p >= 0 ? normalized[size_t(p) * D + c] : history[size_t(c) * HISTORY + (9 + p)];

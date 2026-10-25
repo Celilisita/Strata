@@ -1,17 +1,64 @@
 #include "strata/qwen35moe/runtime.hpp"
+#include "tg_gu_cluster.hpp"
+#include "tg_quant_down_pair.hpp"
+#include "strata/qwen35moe/shared_f16_gemm.hpp"
 #include "strata/qwen35moe/cuda_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/native_quantize_rows.hpp"
+#include "strata/qwen35moe/mapped_pp.hpp"
+#ifdef STRATA_BLACKWELL_MMQ
+#include "strata/prefill/native_blackwell_mmq.hpp"
+#endif
 #include <cstdlib>
+#include "strata/prefill/native_code_sum_support.hpp"
+#include "../prefill/native_down_direct_packed.hpp"
 
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
+#include <optional>
 #include <stdexcept>
 #include <vector>
 
 namespace strata::qwen35moe {
+
+bool tg_gu_cluster_enabled(){
+    static const bool enabled=tg_gu_cluster_flag(std::getenv("STRATA_QWEN35_TG_GU_CLUSTER"));
+    return enabled;
+}
+bool tg_gu_cluster_provider(bool request,const TgGuClusterView& view,void* stream){
+    const auto& a=view.native;
+    if(!stream||!a.addresses||!a.input_rows||!a.down_addresses||!a.input_q8||
+       !a.shared_gate||!a.shared_up||!a.expert_hidden||!a.shared_hidden||
+       !view.expert_gu||!view.shared_gate_output||!view.shared_up_output)
+        throw std::invalid_argument("invalid TG GU cluster view");
+    if(request)return kernels::native_tg_gu_cluster(a,stream);
+    kernels::native_mmvq_grouped(12,a.addresses,a.input_rows,a.input_q8,view.expert_gu,2048,512,16,stream);
+    swiglu(view.expert_gu,view.expert_gu+8*512,a.expert_hidden,8*512,stream,a.down_addresses,512);
+    kernels::native_mmvq(12,a.shared_gate,a.input_q8,view.shared_gate_output,2048,512,1,stream);
+    kernels::native_mmvq(12,a.shared_up,a.input_q8,view.shared_up_output,2048,512,1,stream);
+    swiglu(view.shared_gate_output,view.shared_up_output,a.shared_hidden,512,stream);
+    return false;
+}
+
+bool tg_quant_down_pair_enabled(){
+    static const bool enabled=[] {
+        const bool pair=tg_quant_down_pair_flag(std::getenv("STRATA_QWEN35_TG_QUANT_DOWN_PAIR"));
+        if(!pair)return false;
+        return tg_quant_down_pair_dependencies(pair,tg_gu_cluster_enabled(),
+            tg_quant_down_pair_flag(std::getenv("STRATA_QWEN35_TG_DOWN_ROW4")));
+    }();return enabled;
+}
+bool tg_quant_down_pair_provider(bool request,int type,const kernels::NativeTgQuantDownPair& a,void* stream){
+    if(request)return kernels::native_tg_quant_down_pair(type,a,stream);
+    kernels::native_quantize_rows(a.expert_hidden,a.expert_q8,512,8,false,stream,a.down_addresses);
+    kernels::native_mmvq_grouped(type,a.down_addresses,a.down_rows,a.expert_q8,a.expert_parts,512,2048,8,stream);
+    kernels::native_quantize_rows(a.shared_hidden,a.shared_q8,512,1,false,stream);
+    kernels::native_mmvq(type,a.shared_down,a.shared_q8,a.shared_output,512,2048,1,stream);
+    return false;
+}
 
 void Runtime::batch_moe_grouped(size_t il, const LayerWeights& layer, int count,
                                 const std::string& reference, Metrics& metrics) {
@@ -42,6 +89,9 @@ void Runtime::batch_moe_grouped_ready(size_t il, const LayerWeights& layer, int 
 
     if (!prefill_events_.empty() && !decode_phase_)
         cuda_check(cudaEventRecord(prefill_events_[prefill_event_offset_ + il][2], stream_), "prefill copy begin");
+    prefetch_routes(il, ids); // Exposed copy wait is inside existing copy interval.
+    const auto newly_loaded=prepare_expert_copy_runs(il,count,reference,ids,metrics);
+    const auto gu_reserved=!decode_phase_&&prefill_config_.gu_copy_wave ? prepare_gu_copy(il,count,reference,ids,metrics) : 0;
     const bool profile_address = !decode_phase_ && !prefill_events_.empty();
     const auto address_start = profile_address ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     auto& gu_address = b.host_expert_addresses;
@@ -63,6 +113,30 @@ void Runtime::batch_moe_grouped_ready(size_t il, const LayerWeights& layer, int 
         }
     }
     const size_t gu_bytes = kernels::native_mmvq_weight_bytes(12, 2048, 512);
+    const int down_type = int(expert_sources_[il].down_exps->type);
+    std::optional<MappedPpLayer> mapped;
+#ifdef STRATA_BLACKWELL_MMQ
+    // SM120 source definition is required for THIS translation unit too.
+    // Enough nonresident slots preserve all real/fallback views until compute.
+    if (prefill_config_.mapped_pp && !decode_phase_ && count >= 1024 && count <= 2048 &&
+        !b.expert_stage.data() && b.down_mmq && prefill_config_.grouped_gu_mmq && prefill_config_.grouped_down_mmq &&
+        spec_.n_embd == 2048 && spec_.n_ff_exp == 512 && spec_.n_expert == 256 &&
+        int(expert_sources_[il].gate_exps->type) == 12 && int(expert_sources_[il].up_exps->type) == 12 &&
+        (down_type == 12 || down_type == 13) &&
+        expert_cache_.slots >= size_t(resident_layers_ + 1) * 256 &&
+        expert_cache_.key_to_slot.size() >= (il + 1) * 256 && host_readonly_.bytes() &&
+        prefill::mmq::blackwell_mmq_backend(12, 2) == 6 && prefill::mmq::blackwell_mmq_backend(down_type, 1) == 6) {
+        const char* setting = std::getenv("STRATA_BENCH_GROUP_ROWS");
+        if (setting && std::strcmp(setting, "64") && std::strcmp(setting, "128") && std::strcmp(setting, "auto"))
+            throw std::invalid_argument("mapped PP group rows require64,128 orauto");
+        // The auto provider keeps64 for this path's entries<=16384.
+        const int tile_rows = setting && !std::strcmp(setting, "128") ? 128 : 64;
+        const auto& source = expert_sources_[il];
+        mapped.emplace(host_readonly_, gguf_.tensor_data(*source.gate_exps), gguf_.tensor_data(*source.up_exps),
+            gguf_.tensor_data(*source.down_exps), gu_bytes,
+            kernels::native_mmvq_weight_bytes(down_type, 512, 2048), tile_rows, ids.data(), ids.size());
+    }
+#endif
     for (int entry = 0; entry < entries; ++entry) {
         const int token = entry / 8;
         const int id = ids[size_t(entry)];
@@ -98,7 +172,11 @@ void Runtime::batch_moe_grouped_ready(size_t il, const LayerWeights& layer, int 
             }
             b.expert_stage_age[size_t(slot)] = ++b.expert_stage_tick;
         } else {
-            view = expert_view(il, id, expert_sources_[il], metrics);
+            MappedPpWeights alias;
+            if (mapped && mapped->view(id, expert_cache_.key_to_slot[il * 256 + size_t(id)] >= 0, alias))
+                view = {alias.gate, alias.up, alias.down};
+            else
+                view = expert_view(il, id, expert_sources_[il], metrics);
         }
         gu_address[size_t(entry)] =
             static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(view.gate));
@@ -110,13 +188,23 @@ void Runtime::batch_moe_grouped_ready(size_t il, const LayerWeights& layer, int 
             static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(view.down));
         down_row[size_t(entry)] = entry;
     }
+    if(metrics.expert_cache_hits<newly_loaded+gu_reserved)throw std::runtime_error("copy-runs hit accounting underflow");
+    metrics.expert_cache_hits-=newly_loaded+gu_reserved; // First real cold reference remains a miss.
+    if (mapped) {
+        const auto cost = mapped->cost();
+        metrics.pp_mapped_entries += cost.entries;
+        metrics.pp_mapped_unique += cost.unique;
+        metrics.pp_mapped_logical_weight_bytes += cost.logical_weight_bytes;
+        metrics.pp_mapped_expected_tile_bytes += cost.expected_tile_bytes;
+    }
     if (profile_address) metrics.pp_address_ms += std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - address_start).count();
     if (!prefill_events_.empty() && !decode_phase_)
         cuda_check(cudaEventRecord(prefill_events_[prefill_event_offset_ + il][3], stream_), "prefill copy end");
     std::chrono::steady_clock::time_point table_copy_start;
     if (measure_table) table_copy_start = std::chrono::steady_clock::now();
-    const bool gathered_gu = (!decode_phase_ && count >= 1024 && prefill_config_.grouped_gu_mmq) ||
+    const bool gathered_gu = (!decode_phase_ && count >= 1024 && prefill_config_.grouped_gu_mmq &&
+        prefill::mmq::native_code_sum_grouped_supported(12, 2048, 512)) ||
                              (b.routed_tc && routed_tc_enabled_ && routed_gu_gathered_ &&
                              !decode_phase_ && count >= 1024);
     if (!gathered_gu) {
@@ -128,10 +216,16 @@ void Runtime::batch_moe_grouped_ready(size_t il, const LayerWeights& layer, int 
             "grouped gate/up rows");
         metrics.control_h2d += size_t(entries * 2) * (sizeof(unsigned long long) + sizeof(int32_t));
     }
-    const int down_type = int(expert_sources_[il].down_exps->type);
     const bool tc_down = (down_type == 12 || down_type == 14) && b.routed_tc && routed_tc_enabled_ &&
         !decode_phase_ && count >= 1024;
-    if (!tc_down) {
+    bool q5_mmq_down = false;
+#ifdef STRATA_BLACKWELL_MMQ
+    // Match batch_moe_down_mmq: Q5 PP consumes host tables through its own
+    // grouped plan; the legacy device tables are needed only by the fallback.
+    q5_mmq_down = down_type == 13 && !decode_phase_ && count >= 1024 &&
+        prefill_config_.grouped_down_mmq && prefill::mmq::blackwell_mmq_backend(down_type, 1) == 6;
+#endif
+    if (!tc_down && !q5_mmq_down) {
         cuda_check(cudaMemcpyAsync(b.down_addresses.data(), down_address.data(),
             size_t(entries) * sizeof(unsigned long long), cudaMemcpyHostToDevice, stream_),
             "grouped down addresses");
@@ -168,95 +262,6 @@ void Runtime::batch_moe_resident(size_t il, const LayerWeights& layer, Metrics& 
     ++metrics.tg_gpu_hit_layers;
     ++metrics.tg_device_layers;
     batch_moe_grouped_compute(il, layer, 1, "", metrics);
-}
-
-void Runtime::batch_moe_grouped_compute(size_t il, const LayerWeights& layer, int count,
-                                        const std::string& reference, Metrics& metrics) {
-    auto& b = batch_;
-    auto f = [](DeviceBuffer& buffer) { return buffer.as<float>(); };
-    const int entries = count * 8;
-    const bool dynamic = tg_dynamic_ && decode_phase_ &&
-        (count == 1 || (count == 2 && dynamic_pair_args_.bytes()));
-
-    batch_quantize_q8(f(b.norm), count, 2048);
-    if (checkpoint_sink_) {
-        checkpoint_sink_->gdn_detail("moe_input_q8", b.input_q8.data(),
-            kernels::native_q8_1_bytes(2048) * count, true, stream_);
-        checkpoint_sink_->gdn_detail("route_ids", b.ids.data(), size_t(count) * 8 * 4, false, stream_);
-    }
-    const bool tc = b.routed_tc && routed_tc_enabled_ && !decode_phase_ && count >= 1024;
-    uint64_t tc_launches = 0;
-    uint64_t gu_launches = batch_moe_gu_mmq(count, metrics);
-    if (!gu_launches) {
-        if (tc && routed_gu_gathered_) {
-            gu_launches = 0;
-            for (int part = 0; part < 2; ++part) {
-                const auto work = b.routed_tc->run(12,
-                    b.host_expert_addresses.data() + size_t(part) * entries,
-                    b.host_expert_rows.data() + size_t(part) * entries,
-                    entries, b.input_q8.data(), f(b.expert_gu) + size_t(part) * entries * 512,
-                    2048, 512, true, prefill_config_.q4_gu_reuse ? 2 : 1);
-                metrics.control_h2d += work.control_h2d;
-                gu_launches += work.launches;
-            }
-        } else {
-            gu_launches = 1;
-            // Feature-off and TG preserve the canonical one-column route schedule.
-            kernels::native_mmvq_grouped(12, b.expert_addresses.as<unsigned long long>(),
-                b.expert_rows.as<int32_t>(), b.input_q8.data(), f(b.expert_gu),
-                2048, 512, entries * 2, stream_);
-        }
-    }
-    swiglu(f(b.expert_gu), f(b.expert_gu) + size_t(entries) * 512,
-           f(b.expert_hidden), entries * 512, stream_,
-           dynamic ? b.down_addresses.as<unsigned long long>() : nullptr, 512);
-    if (!prefill_events_.empty() && !decode_phase_)
-        cuda_check(cudaEventRecord(prefill_events_[prefill_event_offset_ + il][5], stream_), "prefill GU end");
-    const char* setting = std::getenv("STRATA_QWEN35_BULK_QUANT");
-    const bool bulk = !decode_phase_ && setting && std::string(setting) == "1";
-    const size_t quant_launches = kernels::native_quantize_rows(f(b.expert_hidden),
-        b.expert_q8.data(), 512, entries, bulk, stream_,
-        dynamic ? b.down_addresses.as<unsigned long long>() : nullptr);
-    const int down_type = int(expert_sources_[il].down_exps->type);
-    const uint64_t mmq_launches = batch_moe_down_mmq(il, count, metrics);
-    if (mmq_launches) tc_launches += mmq_launches;
-    else if (tc && (down_type == 12 || down_type == 14)) {
-        const auto work = b.routed_tc->run(down_type, b.host_down_addresses.data(),
-            b.host_down_rows.data(), entries, b.expert_q8.data(), f(b.expert_parts), 512, 2048);
-        metrics.control_h2d += work.control_h2d; tc_launches += work.launches;
-    } else {
-    kernels::native_mmvq_grouped(down_type, b.down_addresses.as<unsigned long long>(),
-                                 b.down_rows.as<int32_t>(), b.expert_q8.data(),
-                                 f(b.expert_parts), 512, 2048, entries, stream_);
-    }
-
-    if (!prefill_events_.empty() && !decode_phase_)
-        cuda_check(cudaEventRecord(prefill_events_[prefill_event_offset_ + il][6], stream_), "prefill Down end");
-    batch_project_native(layer.shared_gate, f(b.shared_gate), count, 2048, 512);
-    batch_project_native(layer.shared_up, f(b.shared_up), count, 2048, 512);
-    swiglu(f(b.shared_gate), f(b.shared_up), f(b.shared_hidden), count * 512, stream_);
-    batch_quantize_q8(f(b.shared_hidden), count, 512);
-    batch_project_native(layer.shared_down, f(b.shared_output), count, 512, 2048);
-    gate_shared_batch(f(b.shared_output), f(b.logits), count, stream_);
-    if (dynamic)
-        moe_combine_continue(f(b.expert_parts), f(b.weights), f(b.shared_output),
-                             f(b.mixer), f(b.hidden),
-                             (count == 2 ? dynamic_pair_args_ : dynamic_args_).as<core::NativeMissArgs>() + il, stream_, count);
-    else
-        moe_combine_batch(f(b.expert_parts), f(b.weights), f(b.shared_output),
-                          f(b.mixer), f(b.hidden), count, stream_);
-    if (!prefill_events_.empty() && !decode_phase_)
-        cuda_check(cudaEventRecord(prefill_events_[prefill_event_offset_ + il][4], stream_), "prefill MoE end");
-    metrics.expert_launches += (tc ? 3 + gu_launches + tc_launches : 4 + gu_launches) + quant_launches +
-                               (bulk ? 1 : size_t((count + 7) / 8)) +
-        (prefill_tc_ && !decode_phase_ && count >= 1024
-            ? 18 + 9 * size_t((count + 1023) / 1024 - 1) : size_t((count + 7) / 8) * 3);
-    if (!reference.empty()) {
-        batch_probe_.shared = batch_stage_error(reference, "ffn_shexp_gated-0",
-                                                 f(b.shared_output), 2048);
-        batch_probe_.moe_out = batch_stage_error(reference, "l_out-0",
-                                                 f(b.hidden), 2048);
-    }
 }
 
 void Runtime::grouped_moe_token(size_t il, const LayerWeights& layer, Metrics& metrics) {

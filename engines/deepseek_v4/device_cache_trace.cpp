@@ -47,8 +47,23 @@ bool bind_cache_graph_trace(void* context, CacheGraphTrace* trace) {
 void cache_graph_phase(void* context, CacheGraphPhase phase, uint32_t stream) {
     actor = find(context);
     if (!actor) return;
+    if(phase==CacheGraphPhase::Direct)++actor->graph_compute_calls;
+    if(phase==CacheGraphPhase::Capture)++actor->graph_captures;
+    if(phase==CacheGraphPhase::Launch)++actor->graph_launches;
+    const uint64_t now=cache_trace_nanoseconds();
+    if(actor->causal_phases&&phase==CacheGraphPhase::Enqueued&&
+       actor->phase.load(std::memory_order_acquire)==uint32_t(CacheGraphPhase::Launch)) {
+        const uint64_t before=actor->timestamp_ns.load(std::memory_order_relaxed);
+        if(now<before)actor->graph_launch_host_errors.fetch_add(1,std::memory_order_relaxed);
+        else {
+            const uint64_t elapsed=now-before;actor->graph_launch_host_ns.fetch_add(elapsed,std::memory_order_relaxed);
+            actor->graph_launch_host_count.fetch_add(1,std::memory_order_relaxed);
+            auto maximum=actor->graph_launch_host_max_ns.load(std::memory_order_relaxed);
+            while(elapsed>maximum&&!actor->graph_launch_host_max_ns.compare_exchange_weak(maximum,elapsed,std::memory_order_relaxed)){}
+        }
+    }
     actor->stream.store(stream, std::memory_order_relaxed);
-    actor->timestamp_ns.store(cache_trace_nanoseconds(), std::memory_order_relaxed);
+    actor->timestamp_ns.store(now, std::memory_order_relaxed);
     actor->phase.store(uint32_t(phase), std::memory_order_release);
 }
 uint32_t cache_resource_begin(CacheGraphPhase phase) {
@@ -65,6 +80,10 @@ void cache_graph_miss_progress() {
     if (!actor || actor->phase.load(std::memory_order_relaxed) != uint32_t(CacheGraphPhase::Direct)) return;
     auto* packet = actor->miss_packet;
     if (!packet || packet->sequence == packet->response || packet->error) return;
+    // CPU-only service5 performs no CUDA submission or bank mutation. Its
+    // existing device join owns completion; eager enqueuing may continue.
+    // GPU miss4 and every DMA-bearing provider retain the queue drain guard.
+    if(actor->cpu_async_enqueue && packet->native_request==5)return;
     const auto start = cache_trace_nanoseconds();
     auto ticket_start = start;
     auto ticket = packet->sequence;

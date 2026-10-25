@@ -1,14 +1,22 @@
 #pragma once
 #include "strata/qwen35moe/dense_cost.hpp"
+#include "strata/qwen35moe/prefetch_cost.hpp"
 #include <cstddef>
 #include <cstdint>
 namespace strata::qwen35moe {
 struct Metrics {
+    PpPrefetchCost pp_prefetch;
     uint64_t mtp_windows = 0, mtp_accepted = 0, verify_tokens = 0;
     uint64_t rollback_bytes = 0, kv_catchup_rows = 0;
     uint64_t expert_h2d = 0, visual_h2d = 0;
     uint64_t context_cache_d2d = 0;
     uint64_t expert_h2d_calls = 0;
+    uint64_t expert_h2d_logical_copies = 0, expert_h2d_2d_calls = 0;
+    uint64_t expert_h2d_registered_bytes = 0, expert_h2d_pageable_bytes = 0;
+    uint64_t pp_mapped_entries = 0, pp_mapped_unique = 0;
+    // Unique G/U/D bytes and sum(weight_bytes*ceil(routes/tile_rows)); logical
+    // demand estimates, never device-cache hits or measured PCIe transfer bytes.
+    uint64_t pp_mapped_logical_weight_bytes = 0, pp_mapped_expected_tile_bytes = 0;
     size_t gpu_min_free_bytes = size_t(-1);
     uint64_t cpu_expert_read = 0;
     uint64_t cpu_result_h2d = 0;
@@ -52,6 +60,10 @@ struct Metrics {
     double pp_copy_event_ms = 0;
     double pp_moe_event_ms = 0;
     double pp_gu_event_ms = 0, pp_down_event_ms = 0, pp_shared_event_ms = 0;
+    uint64_t pp_gu_plan_calls = 0, pp_gu_plan_active_calls = 0, pp_gu_plan_invalid = 0;
+    uint64_t pp_gu_plan_groups = 0, pp_gu_plan_max_rows = 0, pp_gu_plan_entries = 0;
+    uint64_t pp_gu_plan_active_tiles = 0, pp_gu_plan_rectangular_tiles = 0;
+    uint64_t pp_gu_plan_scheduled_tiles = 0, pp_gu_plan_tile_control_bytes = 0;
     uint64_t route_d2h = 0;
     uint64_t control_h2d = 0;
     uint64_t control_d2h = 0, cpu_norm_d2h = 0;

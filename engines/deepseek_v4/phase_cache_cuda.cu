@@ -18,3 +18,27 @@ void phase_swap_rows(ggml_backend_t backend,void* gate,void* up,void* down,size_
     CUDA_CHECK(cudaGetLastError());
 }
 }
+
+namespace strata::deepseek_v4 {
+namespace {
+__global__ void swap_mixed(uint32_t* first,size_t n0,uint32_t* second,size_t n1,
+                           uint32_t* third,size_t n2,int a,int b) {
+    for(size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<n0+n1+n2;i+=size_t(gridDim.x)*blockDim.x) {
+        uint32_t* bank;size_t offset,words;
+        if(i<n0){bank=first;offset=i;words=n0;}
+        else if(i<n0+n1){bank=second;offset=i-n0;words=n1;}
+        else {bank=third;offset=i-n0-n1;words=n2;}
+        const auto old=bank[size_t(a)*words+offset];
+        bank[size_t(a)*words+offset]=bank[size_t(b)*words+offset];bank[size_t(b)*words+offset]=old;
+    }
+}
+}
+void phase_swap_rows_mixed(ggml_backend_t backend,void* first,size_t n0,void* second,size_t n1,
+                           void* third,size_t n2,int a,int b) {
+    GGML_ASSERT(backend&&first&&second&&third&&n0&&n1&&n2&&n0%4==0&&n1%4==0&&n2%4==0&&a>=0&&b>=0);
+    auto* ctx=static_cast<ggml_backend_cuda_context*>(backend->context);ggml_cuda_set_device(ctx->device);
+    swap_mixed<<<512,128,0,ctx->stream()>>>(static_cast<uint32_t*>(first),n0/4,
+        static_cast<uint32_t*>(second),n1/4,static_cast<uint32_t*>(third),n2/4,a,b);
+    CUDA_CHECK(cudaGetLastError());
+}
+}

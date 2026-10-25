@@ -13,6 +13,7 @@ struct NativeMissSource {
     const uint8_t* down = nullptr;
     kernels::cpu::NativeFmt format;
     int n_expert = 0;
+    const float *gate_scales=nullptr,*up_scales=nullptr,*down_scales=nullptr;
 };
 struct NativeMissStats {
     uint64_t requests = 0, experts = 0, expert_bytes = 0;
@@ -27,7 +28,8 @@ struct NativeMissStats {
 class NativeMissService {
 public:
     NativeMissService(kernels::cpu::ExpertPool& pool,
-                      std::vector<NativeMissSource> sources, int n_embd, int ranks, int max_tokens = 1);
+                      std::vector<NativeMissSource> sources, int n_embd, int ranks, int max_tokens = 1,
+                      bool route_ledger = false);
     ~NativeMissService();
     NativeMissService(const NativeMissService&) = delete;
     NativeMissService& operator=(const NativeMissService&) = delete;
@@ -36,6 +38,8 @@ public:
     void stop();
     NativeMissArgs device_args() const;
     NativeMissStats snapshot() const;
+    // Caller has completed the normal head sync before reading this mapped view.
+    const NativeRouteLedger* route_ledger() const;
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

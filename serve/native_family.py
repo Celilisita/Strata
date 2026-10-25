@@ -9,6 +9,21 @@ import threading
 from pathlib import Path
 
 
+def configured_dspark(cfg):
+    """Resolve the greedy-only feature before either model allocates VRAM."""
+    requested = bool(cfg.get("dspark", False))
+    if not requested:
+        return False, False, None
+    # Inspect only mode fields. The shared server validates/normalizes other
+    # config sampling values (including integer-valued floats) before use.
+    sampling = {k: v for k, v in (cfg.get("sampling") or {}).items() if v is not None}
+    sampling.setdefault("temperature", 0.6)
+    sampled = float(sampling["temperature"]) > 0 or any(
+        float(sampling.get(key, default)) != default for key, default in
+        (("frequency_penalty", 0), ("presence_penalty", 0), ("repetition_penalty", 1)))
+    return requested, not sampled, "configured_sampling" if sampled else None
+
+
 class NativeFamilyEngine:
     def __init__(self, cfg, tokenizer, environment):
         from serve.native_engine import NativeFamilyRunner
@@ -22,13 +37,19 @@ class NativeFamilyEngine:
         if not self.stops:
             raise ValueError("native tokenizer has no configured stop token")
         self.stops.update(int(t) for t in cfg.get("stop_token_ids", []))
-        self.environment = dict(environment)
+        from serve.native_dense_profile import prepare_environment
+        self.environment = prepare_environment(cfg, environment)
         gpu = cfg["gpu_uuid"]
         identity = subprocess.run(["nvidia-smi", "--id=" + gpu,
                                    "--query-gpu=uuid,compute_cap", "--format=csv,noheader"],
                                   capture_output=True, text=True, check=True).stdout.strip().split(",")
         if len(identity) != 2 or identity[0].strip() != gpu or float(identity[1]) < 7:
             raise ValueError("native device identity/capability mismatch")
+        if (self.family == "qwen35_dense" and
+                (cfg.get("context_policy", {}).get("resident_tokens") == 40960 or
+                 cfg.get("variant") == "qwen35_27b_nvfp4") and
+                float(identity[1]) != 12.0):
+            raise ValueError("Dense selected NVFP4/resident-row profile requires SM120")
         self.environment.update(CUDA_VISIBLE_DEVICES=gpu, CUDA_DEVICE_ORDER="PCI_BUS_ID")
         os.environ.update(CUDA_VISIBLE_DEVICES=gpu, CUDA_DEVICE_ORDER="PCI_BUS_ID")
         directories = cfg.get("dll_dirs", [])
@@ -40,7 +61,7 @@ class NativeFamilyEngine:
                      "kv_policy": cfg.get("kv_policy", "on-demand"),
                      "capabilities": cfg["capabilities"]}
         self._last = {}; self.request_state = threading.local()
-        self.progress = self.prompt_perf = self.request_phase = None
+        self.prompt_perf = self.request_phase = None
         self.frontend_facts = {}; self.runner = None
         self.runner_type = NativeFamilyRunner
         self.restart()
@@ -58,6 +79,12 @@ class NativeFamilyEngine:
     def proc(self):
         return None if self.runner is None else self.runner.proc
 
+    def __getattr__(self, name):
+        if name in ("progress", "progress_ms", "prefill_tok_s_mean", "prefill_meter"):
+            runner = self.__dict__.get("runner")
+            return None if runner is None else getattr(runner, name, None)
+        raise AttributeError(name)
+
     def alive(self):
         return self.proc is not None and self.proc.poll() is None
 
@@ -73,14 +100,23 @@ class NativeFamilyEngine:
     def restart(self):
         self.close()
         cfg = self.cfg
+        requested, enabled, reason = configured_dspark(cfg)
+        self.info.update(dspark_requested=requested, dspark=enabled, dspark_disabled_reason=reason)
         self.runner = self.runner_type(
             Path(cfg["exe"]), Path(cfg["model"]),
             Path(cfg["draft"]) if cfg.get("draft") else None,
             Path(cfg["gguf_python"]) if cfg.get("gguf_python") else None,
             self.max_context, Path(cfg["temp_dir"]), int(cfg.get("block_size", 4)),
-            self.batch, bool(cfg.get("dspark", False)), family=self.family,
+            self.batch, enabled, family=self.family,
             variant=cfg["variant"], mtp=int(cfg.get("mtp", 0)),
-            kv_policy=cfg.get("kv_policy", "ram8k-reuse"), environment=self.environment)
+            kv_policy=cfg.get("kv_policy", "ram8k-reuse"), environment=self.environment,
+            dspark_requested=requested, dspark_disabled_reason=reason)
+        self.unloaded = False
+
+    def unload(self):
+        """Release the owned native engine; retain config for the next load."""
+        self.close()
+        self.unloaded = True
 
     def close(self):
         if self.runner is not None:
@@ -97,11 +133,8 @@ class NativeFamilyEngine:
             raise ValueError("native families use model-specific prepared visual spans")
         from serve.native_sampling import parameters
         selection = {k: v for k, v in (sampling or {}).items() if v is not None}
+        selection.setdefault("temperature", 0.6)
         parameters(selection)
-        if self.info["dspark"] and (float(selection.get("temperature", 0) or 0) > 0 or
-                any(float(selection.get(k, default)) != default for k, default in
-                    (("frequency_penalty", 0), ("presence_penalty", 0), ("repetition_penalty", 1)))):
-            raise ValueError("DSpark supports greedy generation without penalties")
         events = queue.Queue(); stop = threading.Event(); finished = {}
         self.request_phase = "prefilling"
         self.request_state.last = {}
@@ -118,7 +151,16 @@ class NativeFamilyEngine:
                 finished["last"] = {"prompt_ms": stats["pp_ms"],
                     "decode_ms": stats["total_ms"] - stats["pp_ms"],
                     "generated": stats["generated"], "tg_steps": max(0, stats["generated"] - 1),
-                    "reused": 0, "cache_slots": 0, "prompt_tokens": len(ids)}
+                    "reused": 0, "cache_slots": 0, "prompt_tokens": len(ids),
+                    "drafts_offered": stats["checked_proposals"],
+                    "drafts_accepted": stats["accepted_proposals"],
+                    "speculative_enabled": stats.get("native_speculative", False),
+                    "dspark_requested": stats.get("dspark_requested", False),
+                    "dspark_enabled": stats.get("dspark_enabled", False),
+                    "dspark_disabled_reason": stats.get("dspark_disabled_reason")}
+                self.info["dspark_requested"] = stats.get("dspark_requested", False)
+                self.info["dspark"] = stats.get("dspark_enabled", False)
+                self.info["dspark_disabled_reason"] = stats.get("dspark_disabled_reason")
                 self.last = finished["last"]
                 events.put(("done", None))
             except BaseException as error:
@@ -148,7 +190,7 @@ def validate_config(cfg):
     family = cfg.get("family")
     if family not in ("qwen35_moe", "qwen35_dense"):
         return False
-    variants = ("minicpm_v47", "qwen36_35b") if family == "qwen35_moe" else ("qwen38_27b",)
+    variants = ("minicpm_v47", "qwen36_35b") if family == "qwen35_moe" else ("qwen38_27b", "qwen38_27b_uncensored_nvfp4", "qwen36_27b", "qwen35_27b_nvfp4")
     if cfg.get("variant") not in variants or not cfg.get("gpu_uuid"):
         raise ValueError("native config must bind family, variant and device identity")
     required = ("exe", "model", "tokenizer", "temp_dir")
@@ -178,17 +220,15 @@ def validate_config(cfg):
     if cfg.get("dspark"):
         if cfg.get("variant") != "minicpm_v47" or cfg.get("slots", 1) != 1:
             raise ValueError("DSpark requires MiniCPM single slot")
-        for key in ("draft", "gguf_python"):
-            if not cfg.get(key) or not Path(cfg[key]).exists():
-                raise ValueError("DSpark requires " + key)
+        if configured_dspark(cfg)[1]:
+            for key in ("draft", "gguf_python"):
+                if not cfg.get(key) or not Path(cfg[key]).exists():
+                    raise ValueError("DSpark requires " + key)
     elif family == "qwen35_dense" and cfg.get("slots", 1) != 1:
         raise ValueError("Dense currently supports one slot")
     if family == "qwen35_dense":
-        policy = cfg.get("context_policy", {})
-        ram = cfg.get("kv_policy") == "ram8k-reuse"
-        if policy.get("ram_index_enabled") != ram or (ram and
-                any(policy.get(k) != v for k, v in (("resident_tokens", 32768), ("selected_tokens", 8192), ("keep_queries", 3)))):
-            raise ValueError("Dense context policy differs from its admitted native profile")
+        from serve.native_dense_profile import validate_dense_config
+        validate_dense_config(cfg)
     if cfg.get("vision"):
         expected_format = "minicpm_canvas" if cfg["variant"] == "minicpm_v47" else "qwen"
         if cfg["vision"].get("format", "qwen") != expected_format:

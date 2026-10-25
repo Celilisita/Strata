@@ -50,7 +50,9 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
                       int r0, int r1);
 
 void native_gu_rows_view(const NativeFmt&, const uint8_t* gate, const uint8_t* up,
-                         const void* const* act, int nt, float* const* ff, int r0, int r1);
+                         const void* const* act, int nt, float* const* ff, int r0, int r1,
+                         float gate_scale = 1.f, float up_scale = 1.f);
 void native_down_rows_view(const NativeFmt&, const uint8_t* down,
-                           const void* const* hq, int nt, float* const* out, int r0, int r1);
+                           const void* const* hq, int nt, float* const* out, int r0, int r1,
+                           float down_scale = 1.f);
 }  // namespace strata::kernels::cpu

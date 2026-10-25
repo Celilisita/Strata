@@ -1,7 +1,9 @@
 #include "strata/qwen35moe/runtime.hpp"
+#include "strata/qwen35moe/nvfp4_expert_state.hpp"
 #include "strata/qwen35moe/cpu_state.hpp"
 #include "strata/qwen35moe/cuda_kernels.hpp"
 #include "strata/qwen35moe/router_tiled.hpp"
+#include "strata/qwen35moe/nvfp4_prefix_rows.hpp"
 
 #include <chrono>
 #include <cstdlib>
@@ -9,9 +11,29 @@
 #include <vector>
 
 namespace strata::qwen35moe {
+namespace {
+bool pp_router_f32_sgemm_enabled() {
+    static const bool enabled=[] {
+        const char* p=std::getenv("STRATA_QWEN35_PP_ROUTER_F32_SGEMM");
+        if(!p) return false;
+        if((p[0]!='0' && p[0]!='1') || p[1]!='\0')
+            throw std::invalid_argument("PP_ROUTER_F32_SGEMM must be0 or1");
+        return p[0]=='1';
+    }();
+    return enabled;
+}
+}
 
 void Runtime::batch_moe(size_t il, const LayerWeights& layer, int count,
                         const std::string& reference, Metrics& metrics) {
+    if(nvfp4_) {
+        if(tg_dynamic_ && decode_phase_ && count==1) {batch_moe_device(il,layer,metrics,count);return;}
+        if(decode_phase_ && nvfp4_->cpu_tg) {
+            if(!cpu_)throw std::runtime_error("missing NVFP4 CPU expert state");
+            ++metrics.tg_cpu_layers;batch_moe_cpu(il,layer,count,reference,metrics);
+        } else batch_moe_nvfp4(il,layer,count,reference,metrics);
+        return;
+    }
     if (tg_dynamic_ && decode_phase_ && (count == 1 || (count == 2 && dynamic_pair_args_.bytes()))) {
         batch_moe_device(il, layer, metrics, count);
         return;
@@ -45,8 +67,15 @@ std::vector<int32_t> Runtime::batch_route(const LayerWeights& layer, int count,
     auto f = [](DeviceBuffer& buffer) { return buffer.as<float>(); };
     const char* setting = std::getenv("STRATA_QWEN35_BULK_ROUTE");
     if (!decode_phase_ && setting && std::string(setting) == "1") {
-        if (prefill_config_.router_tiled && count >= 4) {
-            route_project_tiled(layer.router.f32(), f(b.norm), f(b.logits), 2048, 257, count, stream_);
+        const bool sgemm = !mtp_enabled_ && count >= 1024 && prefill_config_.router_tiled &&
+            pp_router_f32_sgemm_enabled() && b.gemm.router_f32(f(b.norm), layer.router.f32(), f(b.logits), count);
+        if (sgemm) {
+            // Projection only: original Top8, route IDs, service and continuation follow below.
+        } else if (prefill_config_.router_tiled && count >= 4) {
+            if(nvfp4_&&nvfp4_prefix_detail::small(count)&&
+               router_tf32x3_policy(std::getenv("STRATA_QWEN35_ROUTER_TF32X3")))
+                route_project_tf32x3(layer.router.f32(),f(b.norm),f(b.logits),2048,257,count,stream_);
+            else route_project_tiled(layer.router.f32(), f(b.norm), f(b.logits), 2048, 257, count, stream_);
             ++b.router_tiled_calls;
         } else route_project(layer.router.f32(), f(b.norm), f(b.logits), 2048, 257, stream_, count);
         route_top8_batch(f(b.logits), b.ids.as<int32_t>(), f(b.weights), count, stream_);

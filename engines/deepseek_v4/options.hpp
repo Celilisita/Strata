@@ -19,6 +19,8 @@ struct Options {
     // Q8_0 is the preferred long-context KV format; F16 remains available
     // for existing calibrated short-context runs.
     std::string kv_type = "f16";
+    // Empty preserves the architecture-specific historical default.
+    std::string flash_attn;
     uint32_t kv_resident = 0;
     int32_t n_threads = 4;
     int32_t gpu_layers = -1;

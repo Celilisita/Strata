@@ -67,7 +67,7 @@ void repack_q6_canonical(const void* source, void* packed, int width, int tokens
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
 void repack_native_q8(const void* input, void* output, int type, int cols, int rows, void* stream, void* sum_residual) {
-    if (!input || !output || !stream || (type != GGML_TYPE_Q4_K && type != GGML_TYPE_Q6_K) ||
+    if (!input || !output || !stream || (type != GGML_TYPE_Q4_K && type != GGML_TYPE_Q5_K && type != GGML_TYPE_Q6_K) ||
         cols < 512 || cols % 512 || rows < 1 || rows > 8192 || (sum_residual && type != GGML_TYPE_Q4_K))
         throw std::invalid_argument("invalid canonical Q8 MMQ layout conversion");
     const int cells = rows * (cols / QK8_1_MMQ);
@@ -81,6 +81,7 @@ void repack_native_q8(const void* input, void* output, int type, int cols, int r
         error = cudaMemsetAsync(correction + cells, 0, 128 * sizeof(*correction), st);
         if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
     }
+    // Q4_K/Q5_K affine loaders require DS4; only Q6_K uses D4.
     if (type == GGML_TYPE_Q6_K) repack<true><<<(cells + 127) / 128, 128, 0, st>>>(src, dst, correction, cols, rows);
     else repack<false><<<(cells + 127) / 128, 128, 0, st>>>(src, dst, correction, cols, rows);
     error = cudaGetLastError();

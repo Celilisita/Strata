@@ -1,5 +1,7 @@
 #pragma once
 #include <cuda_runtime.h>
+#include "strata/qwen35moe/gdn_dense_graph.hpp"
+#include <cstdio>
 #include <array>
 #include <cstdint>
 #include <vector>
@@ -18,9 +20,14 @@ struct MoeGraphEntry {
 };
 // Submission schedule only. No weight/state/residency ownership or host callback.
 struct MoeGraphState {
-    bool enabled = false;
+    bool enabled = false, recurrent_enabled = false;
     uint64_t executed_kernel_nodes = 0;
     std::vector<std::array<MoeGraphEntry,2>> layers;
-    explicit MoeGraphState(size_t count) : layers(count) {}
+    std::vector<MoeGraphEntry> recurrent; // Same weights/state; optional single-row schedule.
+    explicit MoeGraphState(size_t count, bool capture_recurrent = false)
+        : layers(count), recurrent(capture_recurrent ? count : 0), dense_recurrent(count) {}
+    bool dense_recurrent_enabled=false;
+    uint64_t recurrent_submissions=0,recurrent_kernel_nodes=0;
+    std::vector<GdnDenseGraph> dense_recurrent;
 };
 }

@@ -89,7 +89,11 @@ set_property(SOURCE src/kernels/cuda/native_mmvq.cu APPEND PROPERTY COMPILE_DEFI
 
 set_target_properties(strata_qwen35moe_cuda strata_native_sampling PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
 target_compile_options(strata_qwen35moe_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-use_fast_math>)
-target_compile_options(strata_native_sampling PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-use_fast_math>)
+# The qualified Dense sampler was compiled without fast-math. Keep the original
+# MoE-only recipe, while a combined executable uses one frozen sampler owner.
+if(NOT STRATA_QWEN35_DENSE_FINAL223)
+  target_compile_options(strata_native_sampling PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-use_fast_math>)
+endif()
 
 target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/native_expert_views.cpp)
 

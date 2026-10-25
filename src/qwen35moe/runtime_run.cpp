@@ -1,6 +1,10 @@
 #include "strata/qwen35moe/runtime.hpp"
+#include "native_tg_timeline.hpp"
+#include "strata/qwen35moe/nvfp4_expert_state.hpp"
 #include "sampling_state.hpp"
+#include "head_readback.hpp"
 #include "mtp_state.hpp"
+#include "moe_graph_state.hpp"
 #include "strata/qwen35moe/head_pick.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/kernels/elementwise.hpp"
@@ -16,6 +20,18 @@ namespace strata::qwen35moe {
 
 void Runtime::decode_layer(size_t il, const LayerTensors& source, LayerWeights& layer,
                             int position, Metrics& metrics, int rope_offset) {
+    if (decode_phase_ && source.recurrent && moe_graph_ && moe_graph_->recurrent_enabled) {
+        const auto& entry = moe_graph_->recurrent.at(il);
+        if (!entry.exec) throw std::runtime_error("unprepared recurrent decode graph");
+        cuda_check(cudaGraphLaunch(entry.exec, stream_), "launch canonical recurrent layer schedule");
+        moe_graph_->executed_kernel_nodes += entry.kernels;
+        metrics.expert_launches += entry.expert_kernels;
+        ++metrics.moe_graph_launches; ++metrics.moe_host_submissions;
+        ++dynamic_layers_; dynamic_entries_ += spec_.n_expert_used;
+        return;
+    }
+    native_tg_timeline::dense_begin(il,source.recurrent,stream_);
+    if(!source.recurrent||!launch_gdn_dense_graph(il)){
     kernels::native_qsa_rms_norm_weighted(work_.hidden.as<float>(), layer.attn_norm.f32(),
                                            work_.norm.as<float>(), 2048, 1,
                                            float(spec_.rms_epsilon), stream_);
@@ -34,16 +50,25 @@ void Runtime::decode_layer(size_t il, const LayerTensors& source, LayerWeights& 
                                            work_.norm.as<float>(), 2048, 1,
                                            float(spec_.rms_epsilon), stream_);
     if (mtp_probe) mtp_sink_->stage(5, work_.norm.as<float>(), 2048, stream_);
+    }
+    native_tg_timeline::dense_end(il,stream_);
+    if(nvfp4_ && !batch_.capacity)prepare_batch(2); // A one-token first request must also use the typed path.
     if (batch_.capacity) grouped_moe_token(il, layer, metrics);
     else moe_step(il, layer, metrics);
+    native_tg_timeline::moe_end(il,stream_);
 }
 
 int Runtime::run_token(int token, int position, bool need_logits, Metrics& metrics) {
     if (batch_failed_) throw std::runtime_error("batch workspace failed; recreate runtime");
+    if(nvfp4_ && nvfp4_->device_tg && decode_phase_ && !need_logits)
+        throw std::invalid_argument("NVFP4 device TG requires the normal token head boundary");
     std::chrono::steady_clock::time_point token_start;
     if (decode_phase_ && tg_diag_) token_start = std::chrono::steady_clock::now();
     if (position < 0 || position >= kv_capacity_ || token < 0 || token >= int(spec_.n_vocab))
         throw std::out_of_range("Qwen35 token or context position");
+    const auto timeline_scope=native_tg_timeline::begin(
+        nvfp4_&&nvfp4_->device_tg&&tg_dynamic_&&decode_phase_,
+        stream_,decode_epoch_,nvfp4_?nvfp4_->tg_token+1:0,spec_.layers.size());
     sampling_history(&token, 1);
     if (mtp_enabled_ && !decode_phase_ && position > 0) {
         mtp_kv_batch(&token, 1, mtp_->seed.as<float>(), position - 1);
@@ -53,11 +78,23 @@ int Runtime::run_token(int token, int position, bool need_logits, Metrics& metri
 
     for (size_t il = 0; il < spec_.layers.size(); ++il) {
         auto& layer = layers_[il];
+        submit_nvfp4_admission(il,metrics);
         decode_layer(il, spec_.layers[il], layer, position, metrics);
+        // Current Dense/graph is already queued before a later pageable source
+        // may block the host. This bounded lookahead introduces no new executor.
+        if(il+1<spec_.layers.size())submit_nvfp4_admission(il+1,metrics);
         if (checkpoint_sink_)
             checkpoint_sink_->layer(position, il, work_.hidden.as<float>(), stream_, metrics);
     }
     const int result = need_logits ? head_token(metrics) : -1;
+    if(nvfp4_ && nvfp4_->device_tg && tg_dynamic_ && decode_phase_) {
+        native_tg_timeline::harvest(metrics,[&](size_t il) {
+            return nvfp4_->tg_admission &&
+                (nvfp4_->tg_admission->dirty_mask()&(uint64_t(1)<<il))
+                ? expert_prefetch_->decode_ready(il) : nullptr;
+        });
+        replay_nvfp4_routes(metrics);
+    }
     if (mtp_enabled_ && !decode_phase_) {
         if (need_logits) cuda_check(cudaMemcpyAsync(mtp_->seed.data(), work_.norm.data(), 2048 * sizeof(float),
             cudaMemcpyDeviceToDevice, stream_), "MTP main seed");
@@ -73,6 +110,7 @@ int Runtime::run_token(int token, int position, bool need_logits, Metrics& metri
 
 int Runtime::head_token(Metrics& metrics, const GpuWeight* norm, const GpuWeight* output) {
     collect_visual_metrics(metrics);
+    native_tg_timeline::head_begin(stream_);
     selected_logits_ = work_.head_logits.as<float>();
     std::chrono::steady_clock::time_point head_start;
     if (decode_phase_ && tg_diag_) head_start = std::chrono::steady_clock::now();
@@ -87,14 +125,17 @@ int Runtime::head_token(Metrics& metrics, const GpuWeight* norm, const GpuWeight
                            head_partials_.as<HeadPick>(), head_pick_buffer_.as<HeadPick>(), stream_,
                            tg_dynamic_ && decode_phase_
                                ? &dynamic_frame_.as<core::NativeMissFrame>()->failed : nullptr);
+    native_tg_timeline::head_ready(stream_);
     std::chrono::steady_clock::time_point copy_start;
     copy_start = std::chrono::steady_clock::now();
     if (sampling_) {
-        cuda_check(cudaMemcpyAsync(&sampling_->pick, sampling_->gpu.result(), sizeof(kernels::SamplePick),
+        cuda_check(cudaMemcpyAsync(head_readback_ ? head_readback_->data(sizeof(kernels::SamplePick)) : &sampling_->pick,
+            sampling_->gpu.result(), sizeof(kernels::SamplePick),
             cudaMemcpyDeviceToHost, stream_), "read sampled Qwen35 pick");
         metrics.head_d2h += sizeof(kernels::SamplePick);
     } else if (gpu_head_) {
-        cuda_check(cudaMemcpyAsync(&host_pick_, head_pick_buffer_.data(), sizeof(HeadPick),
+        cuda_check(cudaMemcpyAsync(head_readback_ ? head_readback_->data(sizeof(HeadPick)) : &host_pick_,
+                                   head_pick_buffer_.data(), sizeof(HeadPick),
                                    cudaMemcpyDeviceToHost, stream_), "read Qwen35 head pick");
         metrics.head_d2h += sizeof(HeadPick);
     } else {
@@ -107,12 +148,18 @@ int Runtime::head_token(Metrics& metrics, const GpuWeight* norm, const GpuWeight
         metrics.diag_head_copy_ms += std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - copy_start).count();
     const auto wait_start = std::chrono::steady_clock::now();
-    cuda_check(cudaStreamSynchronize(stream_), "wait for Qwen35 logits");
+    const auto waited=cudaStreamSynchronize(stream_);
+    if(waited!=cudaSuccess && nvfp4_ && nvfp4_->device_tg)batch_failed_=true;
+    cuda_check(waited, "wait for Qwen35 logits");
     metrics.head_wait_ms += std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - wait_start).count();
     metrics.head_observe_ms += std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - copy_start).count();
     ++metrics.explicit_syncs;
+    if (head_readback_) {
+        if (sampling_) head_readback_->copy_to(&sampling_->pick, sizeof(kernels::SamplePick));
+        else if (gpu_head_) head_readback_->copy_to(&host_pick_, sizeof(HeadPick));
+    }
     std::chrono::steady_clock::time_point scan_start;
     if (decode_phase_ && tg_diag_) scan_start = std::chrono::steady_clock::now();
     if (sampling_) {

@@ -47,9 +47,11 @@ public:
     }
     void begin(size_t index, bool prefill, cudaStream_t stream) {
         active_ = nullptr;
-        if (!enabled_ || !prefill) return;
+        if (!enabled_) return;
         if (index >= rows_.size()) throw std::out_of_range("dense profile layer");
-        active_ = &rows_[index]; active_->next = 0; active_->cost = {};
+        auto& row = rows_[index]; row.next = 0; row.cost = {};
+        if (!prefill) return; // Explicit skipped row; clear prior-request cost.
+        active_ = &row;
         cuda_check(cudaEventRecord(active_->events[0], stream), "dense profile begin");
         last_ = Clock::now();
     }
@@ -76,6 +78,7 @@ public:
     void collect(size_t index, DenseCost& sum) {
         if (!enabled_) return;
         auto& row = rows_.at(index);
+        if (row.next == 0) return; // Short PP/TG rows record no dense events.
         if (row.next != dense_stages) throw std::logic_error("incomplete dense profile");
         for (size_t i = 0; i < dense_stages; ++i) {
             float ms = 0;

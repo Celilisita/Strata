@@ -1,8 +1,12 @@
+#include <mtp_state_owner.hpp>
+#include "resident_kv_policy.hpp"
 #include "strata/qwen35/native/model.hpp"
 #include "strata/qwen35/native/ops.hpp"
+#include "strata/qwen35/native/output_head.hpp"
 #include "small_prefill_q6_planes.hpp"
 #include <chrono>
 #include <algorithm>
+#include <cstdio>
 
 namespace strata::qwen35::native {
 DenseModel::DenseModel(const strata::qwen35::Spec &s,const DenseWeights &w,DenseLimits l,cudaStream_t stream)
@@ -56,8 +60,8 @@ DenseModel::DenseModel(const strata::qwen35::Spec &s,const DenseWeights &w,Dense
     const size_t state=s.ssm_state*s.ssm_state*s.ssm_rank*sizeof(float);
     if(l.kv_keep_queries&&!l.kv_ram_tokens)throw std::invalid_argument("reuse horizon requires RAM KV");
     if(l.kv_select_tokens&&!l.kv_ram_tokens)throw std::invalid_argument("history budget requires RAM KV");
-    if(l.kv_ram_tokens&&(l.kv_ram_tokens!=32768||l.kv_window_tokens||!l.kv_q8))
-        throw std::invalid_argument("RAM history requires Q8 and exclusive32768resident cache");
+    if(l.kv_ram_tokens&&((l.kv_ram_tokens!=32768&&l.kv_ram_tokens!=40960)||l.kv_window_tokens||!l.kv_q8))
+        throw std::invalid_argument("RAM history requires Q8 and exclusive32768/40960resident cache");
     if(l.kv_window_tokens&&(l.kv_window_tokens!=32768||!l.kv_q8))
         throw std::invalid_argument("sliding selection requires Q8 and explicit32768window");
     cache_capacity_=l.kv_initial_tokens?l.kv_initial_tokens:(l.kv_window_tokens?8192:l.context);
@@ -70,7 +74,8 @@ DenseModel::DenseModel(const strata::qwen35::Spec &s,const DenseWeights &w,Dense
         if(s.layers[i].recurrent){states_[i].history[0]=static_cast<float *>(zero(history));
             states_[i].history[1]=static_cast<float *>(zero(history));states_[i].state=static_cast<float *>(zero(state));}
         else if(l.kv_ram_tokens){auto &c=caches_[i];
-            c.ram=std::make_unique<RamKvCache>(l.kv_initial_tokens?l.kv_initial_tokens:8192,l.kv_ram_tokens,int(s.n_head_kv),stream,kv_selected(),kv_reuse_horizon());
+            c.ram=std::make_unique<RamKvCache>(l.kv_initial_tokens?l.kv_initial_tokens:8192,l.kv_ram_tokens,int(s.n_head_kv),stream,kv_selected(),kv_reuse_horizon(),
+                resident_kv_requested(l.kv_initial_tokens?l.kv_initial_tokens:8192,l.kv_ram_tokens));
             c.key=c.ram->view().key;c.value=c.ram->view().value;
         }else{caches_[i].key=zero(cache);caches_[i].value=zero(cache);}
     }
@@ -80,8 +85,8 @@ DenseModel::DenseModel(const strata::qwen35::Spec &s,const DenseWeights &w,Dense
     logits_=static_cast<float *>(storage_.allocate(s.n_vocab*4));
     picked_=static_cast<int *>(storage_.allocate(4));invalid_=static_cast<unsigned *>(storage_.allocate(4));
     greedy_bytes_=greedy_workspace(int(s.n_vocab));greedy_=storage_.allocate(greedy_bytes_);
-    batch_logits_=static_cast<float *>(storage_.allocate(size_t(3)*s.n_vocab*4));
-    batch_greedy_=storage_.allocate(3*greedy_bytes_);
+    batch_logits_=static_cast<float *>(storage_.allocate(size_t(4)*s.n_vocab*4));
+    batch_greedy_=storage_.allocate(4*greedy_bytes_);
     if(l.qkv_planes){
         const auto cold=std::chrono::steady_clock::now();qkv_views_.resize(s.n_layers);
         const auto &ffn=shared_->shared_ffn(32);
@@ -106,6 +111,7 @@ DenseModel::DenseModel(const strata::qwen35::Spec &s,const DenseWeights &w,Dense
     if(free<DeviceStorage::reserve_bytes())throw std::runtime_error("own Dense setup lacks configured headroom");
 }
 void DenseModel::reset_prefill(cudaStream_t stream){
+    normalize_state_owner(this);
     for(auto &c:caches_)if(c.ram)c.ram->reset(stream);
     const size_t history=3*spec_.ssm_state*(2*spec_.ssm_group+spec_.ssm_rank)*sizeof(float);
     const size_t state=spec_.ssm_state*spec_.ssm_state*spec_.ssm_rank*sizeof(float);
@@ -113,6 +119,48 @@ void DenseModel::reset_prefill(cudaStream_t stream){
         auto &r=states_[i];r.current=0;
         check_cuda(cudaMemsetAsync(r.state,0,state,stream),"own fresh request state reset");
         for(auto *h:r.history)check_cuda(cudaMemsetAsync(h,0,history,stream),"own fresh request history reset");
+    }
+}
+void DenseModel::resume_kv(int valid,cudaStream_t stream){
+    for(auto &c:caches_)if(c.ram)c.ram->resume(valid,stream);
+}
+void DenseModel::save_checkpoint(int position,cudaStream_t stream){
+    const size_t state=spec_.ssm_state*spec_.ssm_state*spec_.ssm_rank*sizeof(float);
+    const size_t history=3*spec_.ssm_state*(2*spec_.ssm_group+spec_.ssm_rank)*sizeof(float);
+    if(!checkpoint_){
+        size_t total=0;
+        for(auto &r:states_)if(r.state)total+=state+2*history;
+        if(!total)return;
+        void *buffer=nullptr;check_cuda(cudaMalloc(&buffer,total),"recurrent checkpoint storage");
+        checkpoint_=buffer;checkpoint_bytes_=total;
+        checkpoint_current_.assign(states_.size(),0);
+        size_t offset=0;
+        for(auto &r:states_)if(r.state){
+            checkpoint_state_.push_back(static_cast<char*>(buffer)+offset);offset+=state;
+            checkpoint_history0_.push_back(static_cast<char*>(buffer)+offset);offset+=history;
+            checkpoint_history1_.push_back(static_cast<char*>(buffer)+offset);offset+=history;
+        }
+    }
+    size_t slot=0;
+    for(size_t i=0;i<states_.size();++i){
+        auto &r=states_[i];if(!r.state)continue;
+        check_cuda(cudaMemcpyAsync(checkpoint_state_[slot],r.state,state,cudaMemcpyDeviceToDevice,stream),"recurrent checkpoint state");
+        check_cuda(cudaMemcpyAsync(checkpoint_history0_[slot],r.history[0],history,cudaMemcpyDeviceToDevice,stream),"recurrent checkpoint history0");
+        check_cuda(cudaMemcpyAsync(checkpoint_history1_[slot],r.history[1],history,cudaMemcpyDeviceToDevice,stream),"recurrent checkpoint history1");
+        checkpoint_current_[i]=int(r.current);++slot;
+    }
+    checkpoint_position_=position;
+}
+void DenseModel::restore_checkpoint(cudaStream_t stream){
+    const size_t state=spec_.ssm_state*spec_.ssm_state*spec_.ssm_rank*sizeof(float);
+    const size_t history=3*spec_.ssm_state*(2*spec_.ssm_group+spec_.ssm_rank)*sizeof(float);
+    size_t slot=0;
+    for(size_t i=0;i<states_.size();++i){
+        auto &r=states_[i];if(!r.state)continue;
+        check_cuda(cudaMemcpyAsync(r.state,checkpoint_state_[slot],state,cudaMemcpyDeviceToDevice,stream),"recurrent restore state");
+        check_cuda(cudaMemcpyAsync(r.history[0],checkpoint_history0_[slot],history,cudaMemcpyDeviceToDevice,stream),"recurrent restore history0");
+        check_cuda(cudaMemcpyAsync(r.history[1],checkpoint_history1_[slot],history,cudaMemcpyDeviceToDevice,stream),"recurrent restore history1");
+        r.current=unsigned(checkpoint_current_[i]);++slot;
     }
 }
 float *DenseModel::embed(const int *ids,int start,int tokens,cudaStream_t stream){
@@ -137,7 +185,7 @@ float *DenseModel::layer(int index,const float *hidden,int start,int tokens,cuda
         auto &r=states_[index];shared_->rebind(weights_.recurrent[index]);
         if(limits_.qkv_planes&&tokens==32&&qkv_views_[index].data)
             shared_->borrow_native32_qkv_planes(qkv_views_[index].data,qkv_views_[index].bytes,stream);
-        shared_->execute({hidden,r.history[r.current],r.state},{r.history[r.current^1],r.state,mtp_prefix_?mtp_prefix_[index]:GdnPrefix{}},tokens,stream);
+        shared_->execute({hidden,r.history[r.current],r.state},{r.history[r.current^1],state_owner_output(this,index,r.state),mtp_prefix_?mtp_prefix_[index]:GdnPrefix{}},tokens,stream);
         r.current^=1;
     }else{
         auto &c=caches_[index];attention_->rebind(weights_.attention[index]);
@@ -156,24 +204,37 @@ CacheSnapshot DenseModel::cache_snapshot(int index) const{
         throw std::invalid_argument("invalid cache snapshot layer");
     return {caches_[index].key,caches_[index].value,cache_capacity_};
 }
-void DenseModel::prefill(const int *ids,int tokens,cudaStream_t stream){
-    if(tokens>limits_.max_tokens){
-        for(int start=0;start<tokens;start+=limits_.max_tokens){
-            const int n=std::min(limits_.max_tokens,tokens-start);
-            prefill_chunk(ids+start,start,n,start+n==tokens,stream);
-        }
-        return;
+void DenseModel::begin_prefill_progress(int tokens,int base){
+    pp_total_=tokens;pp_base_=base;pp_started_=std::chrono::steady_clock::now();
+}
+void DenseModel::prefill(const int *ids,int tokens,cudaStream_t stream,int start){
+    if(start<0||tokens<1||start+tokens>limits_.context)
+        throw std::invalid_argument("invalid Dense prefill resume span");
+    begin_prefill_progress(start+tokens,start);
+    const int chunk=limits_.max_tokens;
+    for(int i=0;i<tokens;i+=chunk){
+        const int n=std::min(chunk,tokens-i);
+        prefill_chunk(ids+i,start+i,n,start+i+n==start+tokens,stream);
     }
-    prefill_chunk(ids,0,tokens,true,stream);
 }
 void DenseModel::prefill_chunk(const int *ids,int start,int tokens,bool pick_last,cudaStream_t stream){
     const bool previous=prefilling_;prefilling_=true;
+    // A chunk boundary is the only rewind point the linear recurrence keeps;
+    // graph capture must not allocate or copy, so it is suppressed there.
+    if(!pp_suppress_)save_checkpoint(start,stream);
     try{
         const float *hidden=embed(ids,start,tokens,stream);
         for(int i=0;i<int(spec_.n_layers);++i)hidden=layer(i,hidden,start,tokens,stream);
         if(pick_last)head(hidden+size_t(tokens-1)*spec_.n_embd,stream);
     }catch(...){prefilling_=previous;throw;}
     prefilling_=previous;
+    if(!pp_suppress_&&pp_total_>0){
+        check_cuda(cudaStreamSynchronize(stream),"own prefill progress completion");
+        const int done=start+tokens;
+        const double ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-pp_started_).count();
+        std::printf("PP %d %d %.0f %.1f\n",done,pp_total_,ms,ms>0.0?1000.0*(double)(done-pp_base_)/ms:0.0);
+        std::fflush(stdout);
+    }
 }
 
 void DenseModel::validate_captured_prefill(bool complete){
@@ -230,7 +291,7 @@ std::vector<ContinuationView> DenseModel::continuation_views(int valid) const{
 void DenseModel::head(const float *last_hidden,cudaStream_t stream){
     rms_norm(last_hidden,weights_.output_norm,final_norm_,int(spec_.n_embd),1,float(spec_.rms_epsilon),stream);
     void *quant=shared_->shared_ffn(1).buffers().quant_input;
-    vector_quantize(final_norm_,quant,int(spec_.n_embd),stream);vector_linear(weights_.head,quant,logits_,stream);
+    output_head_linear(weights_.head,head_service_,final_norm_,quant,logits_,1,stream);
     greedy_pick(logits_,int(spec_.n_vocab),greedy_,greedy_bytes_,picked_,invalid_,stream,token_mask_);
     if(decode_capture_)record_decode_token(picked_,invalid_,*decode_capture_,stream);
 }

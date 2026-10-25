@@ -76,7 +76,7 @@ __global__ void padded_partial_attention(const float *query,const unsigned char 
         __syncthreads();
     }
     wmma::fragment<wmma::accumulator,16,16,16,float> result[4];
-    float carry[6]={};
+    float carry[8]={};
     #pragma unroll
     for(int f=0;f<4;++f)wmma::fill_fragment(result[f],0.0f);
     for(int first=begin;first<end;first+=Keys){
@@ -118,7 +118,7 @@ __global__ void padded_partial_attention(const float *query,const unsigned char 
             for(int f=0;f<4;++f)wmma::store_matrix_sync(tile+(warp*4+f)*16,result[f],Dim,wmma::mem_col_major);
             __syncthreads();
             #pragma unroll
-            for(int row=0;row<3;++row){
+            for(int row=0;row<4;++row){
                 #pragma unroll
                 for(int d=0;d<2;++d)if(row<s.tokens)carry[row*2+d]+=tile[row*Dim+threadIdx.x+d*128];
             }

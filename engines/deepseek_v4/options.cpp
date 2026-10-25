@@ -26,7 +26,7 @@ bool known(std::string_view flag) {
            flag == "--ctx-size" || flag == "--n-ctx" || flag == "-c" ||
            flag == "--batch-size" || flag == "--n-batch" || flag == "-b" ||
            flag == "--ubatch-size" || flag == "--n-ubatch" || flag == "-ub" ||
-           flag == "--kv-type" ||
+           flag == "--kv-type" || flag == "--flash-attn" ||
            flag == "--kv-resident" ||
            flag == "--threads" || flag == "-t" || flag == "--gpu-layers" ||
            flag == "--moe-cache-mib" || flag == "--cache-mib" || flag == "--pinned-experts" ||
@@ -63,6 +63,12 @@ bool parse_options(int argc, char** argv, Options& options,
             if (!integer(value, options.n_ubatch, error, name)) return false;
         } else if (flag == "--kv-type") {
             options.kv_type = value;
+        } else if (flag == "--flash-attn") {
+            if (value != "on" && value != "off" && value != "auto") {
+                error = "--flash-attn must be on, off or auto";
+                return false;
+            }
+            options.flash_attn = value;
         } else if (flag == "--kv-resident") {
             if (!integer(value, options.kv_resident, error, name)) return false;
         } else if (flag == "--threads" || flag == "-t") {
@@ -97,6 +103,9 @@ bool validate_options(const Options& options, std::string& error) {
         error = "ubatch size must be positive and no larger than batch size";
     } else if (options.kv_type != "f16" && options.kv_type != "q8_0") {
         error = "--kv-type must be f16 or q8_0";
+    } else if (!options.flash_attn.empty() && options.flash_attn != "on" &&
+               options.flash_attn != "off" && options.flash_attn != "auto") {
+        error = "--flash-attn must be on, off or auto";
     } else if (options.kv_resident > options.n_ctx) {
         error = "--kv-resident cannot exceed --ctx-size";
     } else if (options.n_threads <= 0) error = "thread count must be positive";
@@ -119,6 +128,7 @@ bool validate_options(const Options& options, std::string& error) {
 const char* options_usage() noexcept {
     return "--model GGUF --device CUDA0 [--mmproj GGUF] [--prompt TEXT]\n"
            "  --ctx-size N --batch-size N --ubatch-size N --threads N --kv-type f16|q8_0\n"
+           "  --flash-attn on|off|auto (omitted: architecture-specific historical default)\n"
            "  --kv-resident N (DSV4 raw KV ring in VRAM; compressed history stays accessible)\n"
            "  --gpu-layers N (-1: all dense layers) --moe-cache-mib N (0: disabled)\n"
            "  --cache-mib is an alias for --moe-cache-mib; --pinned-experts 0|1 (default: 0)\n"

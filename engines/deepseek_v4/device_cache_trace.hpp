@@ -25,6 +25,10 @@ struct CacheGraphTrace {
     void (*enqueue_budget)(void*, uintptr_t stream) = nullptr;
     std::atomic<bool> graph_misses{true};
     std::atomic<uint64_t> graph_preuploads{0}, graph_preupload_ns{0};
+    bool cpu_async_enqueue = false;
+    bool causal_phases = false; // Set once before binding; GLM diagnostic only.
+    std::atomic<uint64_t> graph_launch_host_ns{0},graph_launch_host_max_ns{0},graph_launch_host_count{0},graph_launch_host_errors{0};
+    std::atomic<uint64_t> graph_compute_calls{0}, graph_captures{0}, graph_launches{0};
 };
 struct CacheApiSpan {
     uint64_t max_ns = 0, begin_ns = 0, end_ns = 0, thread = 0;

@@ -1,4 +1,5 @@
 #include "strata/qwen35moe/runtime.hpp"
+#include "compact_expert_prefix.hpp"
 #include <algorithm>
 #include <stdexcept>
 
@@ -6,6 +7,10 @@ namespace strata::qwen35moe {
 void Runtime::resize_expert_cache(size_t slots, Metrics& metrics) {
     auto& cache = expert_cache_;
     if (slots == cache.slots) return;
+    detail::verify_compact_prefix(cache,expert_sources_,batch_.capacity==0);
+    if (cache.data.compact() && slots < cache.data.high_slots()+256)
+        throw std::invalid_argument("compact resize cannot discard high inventory or low layer");
+    prefetch_drain();
     if (slots < size_t(resident_layers_) * 256 + 8)
         throw std::invalid_argument("context budget cannot preserve resident expert layers");
     if (slots < cache.slots) {
@@ -13,6 +18,11 @@ void Runtime::resize_expert_cache(size_t slots, Metrics& metrics) {
         for (int key : cache.slot_to_key) if (key >= 0) retained.push_back(key);
         const int protected_keys = resident_layers_ * 256;
         std::sort(retained.begin(), retained.end(), [&](int a, int b) {
+            if (cache.data.compact()) {
+                const bool ah=size_t(cache.key_to_slot[size_t(a)])<cache.data.high_slots();
+                const bool bh=size_t(cache.key_to_slot[size_t(b)])<cache.data.high_slots();
+                if (ah!=bh) return ah;
+            }
             if ((a < protected_keys) != (b < protected_keys)) return a < protected_keys;
             const auto age_a = cache.age[size_t(cache.key_to_slot[size_t(a)])];
             const auto age_b = cache.age[size_t(cache.key_to_slot[size_t(b)])];
@@ -33,9 +43,12 @@ void Runtime::resize_expert_cache(size_t slots, Metrics& metrics) {
             if (source < slots) continue;
             while (hole < slots && cache.slot_to_key[hole] >= 0) ++hole;
             if (hole == slots) throw std::logic_error("expert compaction has no destination");
+            const size_t bytes=cache.data.capacity(source);
+            if (cache.data.capacity(hole)!=bytes)
+                throw std::logic_error("resize would move expert into incompatible slot");
             cuda_check(cudaMemcpyAsync(cache.data.slot(hole), cache.data.slot(source),
-                cache.stride, cudaMemcpyDeviceToDevice, stream_), "compact resident expert on GPU");
-            metrics.context_cache_d2d += cache.stride;
+                bytes, cudaMemcpyDeviceToDevice, stream_), "compact resident expert on GPU");
+            metrics.context_cache_d2d += bytes;
             cache.key_to_slot[size_t(key)] = int(hole);
             cache.slot_to_key[hole] = key; cache.age[hole] = cache.age[source];
             cache.slot_to_key[source] = -1; cache.age[source] = 0;

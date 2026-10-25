@@ -4,6 +4,7 @@
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/native_dense_q4_row2.hpp"
 #include "strata/kernels/native_mmvq_bulk.hpp"
 #include "strata/kernels/native_quantize_rows.hpp"
 #include "strata/qwen35moe/cuda_kernels.hpp"
@@ -22,34 +23,39 @@ void Runtime::prepare_batch(int capacity) {
     if (batch_failed_) throw std::runtime_error("batch workspace failed; recreate runtime");
     if (capacity < 2 || capacity > 8192)
         throw std::invalid_argument("Qwen35 batched prefill supports 2..8192 tokens");
-    if ((prefill_config_.grouped_down_mmq || prefill_config_.grouped_gu_mmq) && !batch_.down_mmq)
+    if (!nvfp4_ && (prefill_config_.grouped_down_mmq || prefill_config_.grouped_gu_mmq) && !batch_.down_mmq)
         batch_.down_mmq = std::make_unique<prefill::mmq::NativeGroupedMmqProvider>(stream_);
     if ((prefill_config_.mmq_projection || prefill_config_.gdn_qkv_mmq || prefill_config_.gdn_qkv_q4_mmq || prefill_config_.gdn_out_mmq) && !projection_mmq_)
         projection_mmq_ = std::make_unique<prefill::mmq::Context>();
     if (batch_.capacity) {
         if (capacity > batch_.capacity) {
+            prefetch_drain();
             cuda_check(cudaStreamSynchronize(stream_), "drain before batch workspace growth");
             invalidate_moe_graphs();
             batch_failed_ = true;
             batch_.expert_stage.reset();
+            batch_.clear_raw_input();
             allocate_batch(capacity);
             prepare_moe_graphs();
             batch_failed_ = false;
         }
         return;
     }
+    batch_.clear_raw_input();
     allocate_batch(capacity);
     auto& b = batch_;
     std::string error;
     if (!b.gemm.init(stream_, int64_t(8192) * 2048, error)) throw std::runtime_error(error);
     const char* cpu_first = std::getenv("STRATA_QWEN35_CPU_FROM_LAYER");
     const int first = cpu_first ? std::stoi(cpu_first) : 0;
+    if(nvfp4_ && first!=0)throw std::invalid_argument("NVFP4 TG requires CPU_FROM_LAYER0");
     if (first < 0 || first > int(spec_.layers.size()))
         throw std::invalid_argument("invalid CPU expert first layer");
     const char* hits = std::getenv("STRATA_QWEN35_TG_HIT_GPU");
     tg_hit_gpu_ = !hits || std::string(hits) != "0";
     const char* gather = std::getenv("STRATA_QWEN35_TG_DEVICE_GATHER");
     resident_gather_ = gather && std::string(gather) == "1";
+    if(nvfp4_){tg_hit_gpu_=false;resident_gather_=false;} // Old typed GPU TG kernels cannot read40.
     const char* diag = std::getenv("STRATA_QWEN35_TG_DIAG");
     tg_diag_ = diag && std::string(diag) == "1";
     if (tg_diag_)
@@ -60,8 +66,10 @@ void Runtime::prepare_batch(int capacity) {
     if (const char* warm = std::getenv("STRATA_QWEN35_PREWARM_CACHE");
         resident_layers_ || !warm || std::string(warm) != "0")
         prewarm_expert_cache();
+    prepare_host_readonly();
     if (first < int(spec_.layers.size()) && kernels::cpu::native_experts_available())
         cpu_ = std::make_unique<CpuExpertState>(first);
+    if(nvfp4_ && !cpu_)throw std::runtime_error("NVFP4 requires its native CPU expert codec");
     if (std::getenv("STRATA_QWEN35_CUDA_EVENTS")) {
         prefill_events_.resize(expert_sources_.size());
         for (auto& group : prefill_events_)
@@ -87,6 +95,7 @@ void Runtime::batch_quantize_to_half(const float* input, int count, int width) {
 }
 
 void Runtime::batch_quantize_q8(const float* input, int count, int width) {
+    batch_.clear_raw_input();
     if (count < 1 || count > batch_.capacity || (width != 512 && width != 2048 && width != 4096))
         throw std::invalid_argument("invalid Qwen35 batch quantization shape");
     batch_.half_width = 0; batch_.half_count = 0;
@@ -94,6 +103,7 @@ void Runtime::batch_quantize_q8(const float* input, int count, int width) {
     const bool bulk = !decode_phase_ && setting && std::string(setting) == "1";
     const auto launches = kernels::native_quantize_rows(input, batch_.input_q8.data(), width, count, bulk, stream_);
     dense_profile_.launches(launches);
+    batch_.raw_input=input; batch_.raw_input_width=width; batch_.raw_input_count=count;
 }
 
 void Runtime::batch_project_native(const GpuWeight& weight, float* output,
@@ -139,6 +149,11 @@ void Runtime::batch_project_native(const GpuWeight& weight, float* output,
         dense_profile_.launches(launches);
         return;
     }
+    if (count == 1 && kernels::native_dense_q4_row2_eligible(decode_phase_, weight.type, n_in, n_out)) {
+        project(weight, batch_.input_q8.data(), output, n_in, n_out);
+        dense_profile_.launches(1);
+        return;
+    }
     const size_t row_bytes = kernels::native_q8_1_bytes(n_in);
     for (int first = 0; first < count; first += 8) {
         const int ncols = count - first < 8 ? count - first : 8;
@@ -152,10 +167,13 @@ void Runtime::batch_project_native(const GpuWeight& weight, float* output,
 }
 
 int Runtime::run_prefill(const int* tokens, int count, const std::string& reference,
-                         Metrics& metrics, const PrefillObserver* observer) {
+                         Metrics& metrics, const PrefillObserver* observer, int offset) {
     finish_decode(&metrics);
     decode_phase_ = false;
-    if (batch_failed_ || !tokens || count < 2 || count > batch_.capacity || count > kv_capacity_)
+    batch_.clear_raw_input();
+    prefetch_begin();
+    if (batch_failed_ || !tokens || count < 1 || count > batch_.capacity || offset < 0 ||
+        offset + count > kv_capacity_)
         throw std::invalid_argument("unprepared Qwen35 batched prefill");
     auto& b = batch_;
     auto f = [](DeviceBuffer& buffer) { return buffer.as<float>(); };
@@ -169,7 +187,7 @@ int Runtime::run_prefill(const int* tokens, int count, const std::string& refere
     for (size_t il = 0; il < layers_.size(); ++il) {
         if (!prefill_events_.empty())
             cuda_check(cudaEventRecord(prefill_events_[il][0], stream_), "prefill layer begin");
-        decode_batch_layer(il, count, 0, reference, metrics);
+        decode_batch_layer(il, count, offset, reference, metrics);
         // Current route drain proves every preceding layer has completed.
         if (observer && il) observer->notify(int(il), int(layers_.size()));
     }
@@ -178,6 +196,7 @@ int Runtime::run_prefill(const int* tokens, int count, const std::string& refere
                "prefill final hidden");
     sampling_history(tokens, count);
     const int next = head_token(metrics);
+    prefetch_finish(metrics);
     if (mtp_enabled_) {
         const auto mtp_start = std::chrono::steady_clock::now();
         mtp_prompt(tokens, count, b.hidden.as<float>(), metrics);
@@ -189,12 +208,14 @@ int Runtime::run_prefill(const int* tokens, int count, const std::string& refere
 }
 
 int Runtime::run_prefill_long(const int* tokens, int count, Metrics& metrics,
-                              int chunk_capacity, const PrefillObserver* observer) {
+                              int chunk_capacity, const PrefillObserver* observer, int offset) {
     finish_decode(&metrics);
     decode_phase_ = false;
+    batch_.clear_raw_input();
+    prefetch_begin();
     const int chunk = chunk_capacity ? chunk_capacity : batch_.capacity;
     if (batch_failed_ || !tokens || chunk < 2 || chunk > batch_.capacity || count <= chunk ||
-        count > kv_capacity_)
+        offset < 0 || offset + count > kv_capacity_)
         throw std::invalid_argument("invalid Qwen35 long prefill shape");
     for (int t = 0; t < count; ++t)
         if (tokens[t] < 0 || tokens[t] >= int(spec_.n_vocab))
@@ -220,23 +241,24 @@ int Runtime::run_prefill_long(const int* tokens, int count, Metrics& metrics,
     load_prefill_embeddings(tokens, count, current.as<float>());
     metrics.pp_embedding_submit_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - embedding_start).count();
     for (size_t il = 0; il < layers_.size(); ++il) {
-        for (int first = 0; first < count; first += chunk) {
-            const int n = (std::min)(chunk, count - first);
+        for (int local = 0; local < count; local += chunk) {
+            const int n = (std::min)(chunk, count - local);
+            const int first = offset + local;
             const size_t chunk_bytes = size_t(n) * 2048 * sizeof(float);
             cuda_check(cudaMemcpyAsync(b.hidden.data(),
-                                        current.as<float>() + size_t(first) * 2048,
+                                        current.as<float>() + size_t(local) * 2048,
                                         chunk_bytes, cudaMemcpyDeviceToDevice, stream_),
                        "long prefill layer input");
-            prefill_event_offset_ = size_t(first / chunk) * layers_.size();
+            prefill_event_offset_ = size_t(local / chunk) * layers_.size();
             if (!prefill_events_.empty())
                 cuda_check(cudaEventRecord(prefill_events_[prefill_event_offset_ + il][0], stream_),
                            "long prefill layer begin");
             decode_batch_layer(il, n, first, "", metrics);
             // First current-layer route drain proves all previous-layer chunks
             // complete on this stream. Do not wait for the current MoE here.
-            if (observer && il && first == 0)
+            if (observer && il && local == 0)
                 observer->notify(int(il), int(layers_.size()));
-            cuda_check(cudaMemcpyAsync((control ? next : current).as<float>() + size_t(first) * 2048,
+            cuda_check(cudaMemcpyAsync((control ? next : current).as<float>() + size_t(local) * 2048,
                                         b.hidden.data(), chunk_bytes,
                                         cudaMemcpyDeviceToDevice, stream_),
                        "long prefill layer output");
@@ -249,6 +271,7 @@ int Runtime::run_prefill_long(const int* tokens, int count, Metrics& metrics,
                "long prefill final hidden");
     sampling_history(tokens, count);
     const int result = head_token(metrics);
+    prefetch_finish(metrics);
     collect_prefill_events(chunks, metrics);
     prefill_event_offset_ = 0;
     if (mtp_enabled_) {

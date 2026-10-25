@@ -1,0 +1,25 @@
+{
+  "scope": "Local candidates only; hash-delta upload must exclude headers found by remote inventory.",
+  "files": {
+    "cutlass/epilogue/threadblock/epilogue_smem_accumulator.h": {
+      "sha256": "a4eaf2cf19baf2324fba7d2ee6102addf2c7ad097e57d431b71d9f723ccef647",
+      "bytes": 9016
+    },
+    "cutlass/gemm/warp/mma_tensor_op_fragment_iterator.h": {
+      "sha256": "0da893a941fdc3ed43e8430d5cb5c4f40835e7bfa4a72e706f37f0cb7aae2df8",
+      "bytes": 20471
+    },
+    "cutlass/gemm/warp/mma_tensor_op_tile_access_iterator.h": {
+      "sha256": "dc0d12a4124ec1b5fc52e54006d4698829ad9c073fd3ecbd5a812800841cdca6",
+      "bytes": 11018
+    },
+    "cutlass/transform/threadblock/predicated_vector_access_iterator.h": {
+      "sha256": "644bb1f6ec72e4913fe1724a58ae80cc660d9a3793c86fa214a8ca3a9d02dfcd",
+      "bytes": 13088
+    },
+    "cutlass/transform/threadblock/vector_iterator.h": {
+      "sha256": "e6efc290d14eae70c924d2440b4cc8ff9ec73a3b150943234b026fe781b696d6",
+      "bytes": 5226
+    }
+  }
+}

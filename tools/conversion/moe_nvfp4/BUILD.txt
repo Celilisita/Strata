@@ -1,0 +1,25 @@
+Offline converter source handoff; no build or weight conversion was run during cleanup.
+
+The eight implementation files match both actual completed Mini/Qwen conversion
+receipts byte for byte. The original GPU addon, codec checker and README are kept.
+Only this standalone CMakeLists and this build note are new packaging metadata.
+No dependency on the runtime's historical D:/temp CMake hooks or GGML is required.
+
+Dependencies: Python3 + NumPy for the conversion CLI; CUDA12.8 and a compatible
+host C++ compiler for the independent DLL. The original target uses sm120/shared
+cudart and exports the versioned moe_nvfp4_abi_v1 interface. It is distinct from
+the runtime grouped-MoE operator library and contains no model/server loading.
+
+If a future user requests a rebuild, set TEMP/TMP and the build directory to a
+task subdirectory of D:/temp, then from this source directory use:
+  cmake -S . -B D:/temp/strata-moe-converter-build
+  cmake --build D:/temp/strata-moe-converter-build --config Release --target moe-nvfp4-convert
+Choose the actual CUDA12.8 compiler explicitly when more than one toolkit is installed.
+The DLL output name is moe_nvfp4_convert.dll. This handoff does not claim a new
+standalone build reproduces the recorded DLL hash; the existing DLL identity is
+preserved separately in the actual conversion receipts.
+
+See README.txt for explicit original-GGUF source/output/work-dir arguments,
+GPU-library path, the per-expert scale contract and bounded streaming behavior.
+Windows output remains on D:/StrataModels and temporary work on D:/temp.
+No automated rebuild, conversion, overwrite or runtime launch occurs on import.

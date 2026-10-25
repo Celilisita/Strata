@@ -15,6 +15,7 @@ add_library(strata_qwen35_native STATIC
   src/qwen35/native/attention_gemm.cu
   src/qwen35/native/gdn_rows.cu
   src/qwen35/native/recurrent.cpp
+  src/qwen35/native/q8_projection.cu
   src/qwen35/native/recurrent_graph.cpp
   src/qwen35/native/attention_layer.cpp
   src/qwen35/native/weights.cpp
@@ -49,7 +50,7 @@ add_library(strata_qwen35_native STATIC
   src/qwen35/native/mtp_draft_link.cu
   src/qwen35/native/kv_ram.cpp
   src/qwen35/native/kv_ram_write.cu
-  src/qwen35/native/kv_ram_index.cu
+  # final223 ram_block_sort.cu owns ram_select / ram_sort_workspace and fallback.
   src/qwen35/native/attention_ram_decode.cu
   src/qwen35/native/attention_ram_verify.cu
   src/qwen35/native/cache_window.cu
@@ -111,3 +112,7 @@ endif()
 set_target_properties(strata_qwen35_cutlass_swiglu PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
 
 set_target_properties(strata_qwen35_native strata_qwen35_dense_runtime strata_qwen35_gdn_vectorized PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+
+# Source ownership for the frozen provider is registered after the base targets.
+include(${CMAKE_CURRENT_LIST_DIR}/native_dense_extensions.cmake)
+include(${CMAKE_CURRENT_LIST_DIR}/native_dense_fp4.cmake)

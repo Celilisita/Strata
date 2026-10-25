@@ -64,16 +64,21 @@ if(STRATA_DEEPSEEK_EMBEDDED AND MSVC)
     # Limit the C++20 compatibility flag to llama C++ sources. nvcc rejects
     # the naked MSVC option even when it can compile the host source.
     target_compile_options(llama PRIVATE /Zc:char8_t-)
+    # Keep JSON UTF-8 filesystem adapters compatible with disabled char8_t.
+    # Preserve lower feature flags so comparator/template types stay unchanged.
+    target_compile_definitions(llama PRIVATE
+        JSON_HAS_CPP_11=1 JSON_HAS_CPP_14=1 JSON_HAS_CPP_17=1)
 endif()
 # Opt-in hooks retain the canonical model/kernel computation and make mapped
 # routed banks lazy; a bounded layer observer can stop at its chosen boundary.
 target_compile_definitions(llama PRIVATE STRATA_DEEPSEEK4_LAZY_EXPERTS=1)
 target_compile_definitions(llama PUBLIC STRATA_DEEPSEEK_EXPERT_STAGING=1)
-target_include_directories(llama PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_include_directories(llama PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" "${STRATA_LLAMA_SOURCE_DIR}/vendor")
 target_sources(llama PRIVATE expert_staging.cpp expert_staging_attach.cpp
     expert_source_pin.cpp expert_source_pin_backend.cpp expert_frequency.cpp
     canonical_expert_graph.cpp cpu_expert_service.cpp cold_expert_provider.cpp cold_expert_attach.cpp
     cache_leaf_aliases.cpp cache_lease.cpp cache_lease_attach.cpp pp_cache_plan.cpp
+    ../glm5_next/hybrid_provider.cpp
     device_cache.cpp device_cache_worker.cpp device_cache_backend.cpp device_cache_attach.cpp)
 target_sources(llama PRIVATE pp_stream_graph.cpp)
 target_sources(llama PRIVATE packed_expert_store.cpp)
@@ -83,6 +88,8 @@ if(MSVC)
 endif()
 target_sources(llama PRIVATE cache_cost_audit.cpp device_cache_budget.cpp)
 target_sources(llama PRIVATE native_tg_graph.cpp native_tg_service.cpp router_prediction_graph.cpp native_read_ahead.cpp)
+# Shared CUDA/model consumers use one host-only option owner.
+target_sources(ggml-base PRIVATE router_options.cpp)
 set_property(SOURCE pp_stream_graph.cpp native_tg_graph.cpp TARGET_DIRECTORY llama APPEND
     PROPERTY INCLUDE_DIRECTORIES "${STRATA_LLAMA_SOURCE_DIR}/ggml/src")
 if(WIN32 AND MSVC)
@@ -179,15 +186,17 @@ if(STRATA_DEEPSEEK_CUDA)
     set_property(SOURCE device_cache_backend.cpp TARGET_DIRECTORY llama APPEND PROPERTY
         INCLUDE_DIRECTORIES "${CUDAToolkit_INCLUDE_DIRS}" "${STRATA_NATIVE_INCLUDE_DIR}")
     target_link_libraries(llama PRIVATE "$<LINK_ONLY:CUDA::cudart>" "$<LINK_ONLY:CUDA::cuda_driver>")
-    target_sources(ggml-cuda PRIVATE mtp_pool_fixture.cu router_prediction_cuda.cu overlap_compress_cuda.cu shared_pair_cuda.cu qkv_pair_cuda.cu)
+    target_sources(ggml-cuda PRIVATE ../glm5_next/attention_f32_cuda.cu mtp_pool_fixture.cu router_prediction_cuda.cu overlap_compress_cuda.cu shared_pair_cuda.cu qkv_pair_cuda.cu)
     target_sources(ggml-cuda PRIVATE device_cache_trace.cpp device_cache_cuda.cu cache_lease_cuda.cu matrix_timing.cu mapped_cold_cuda.cu hc_coeff_cuda.cu graph_diag.cu
         pp_stream_runtime.cu pp_stream_kernels.cu pp_stream_plan.cpp native_tg_cuda.cu strata_vmm_range.cpp phase_cache_cuda.cu)
-    set_property(SOURCE pp_stream_runtime.cu pp_stream_kernels.cu TARGET_DIRECTORY ggml-cuda APPEND
+    set_property(SOURCE pp_stream_runtime.cu pp_stream_kernels.cu ../glm5_next/attention_f32_cuda.cu TARGET_DIRECTORY ggml-cuda APPEND
         PROPERTY INCLUDE_DIRECTORIES "${STRATA_LLAMA_SOURCE_DIR}/ggml/src/ggml-cuda")
     set_property(SOURCE "${STRATA_LLAMA_SOURCE_DIR}/src/llama-graph.cpp" TARGET_DIRECTORY llama APPEND
         PROPERTY COMPILE_DEFINITIONS STRATA_DEEPSEEK_STREAM_PP=1)
-    set(_lease_hooks "${STRATA_LLAMA_SOURCE_DIR}/ggml/src/ggml-cuda/getrows.cu"
+    set(_lease_hooks "${STRATA_LLAMA_SOURCE_DIR}/ggml/src/ggml-cuda/moe-weighted-reduction.cu"
+                     "${STRATA_LLAMA_SOURCE_DIR}/ggml/src/ggml-cuda/getrows.cu"
                      "${STRATA_LLAMA_SOURCE_DIR}/ggml/src/ggml-cuda/clamp.cu"
+                     "${STRATA_LLAMA_SOURCE_DIR}/ggml/src/ggml-cuda/fattn.cu"
                      "${STRATA_LLAMA_SOURCE_DIR}/ggml/src/ggml-cuda/ggml-cuda.cu")
     # Per-source definitions/includes preserve unrelated CUDA object commands.
     set_property(SOURCE ${_lease_hooks} TARGET_DIRECTORY ggml-cuda APPEND
@@ -222,6 +231,8 @@ if(STRATA_DEEPSEEK_MTMD)
     target_link_libraries(strata_deepseek_v4_runtime PUBLIC mtmd)
     target_compile_definitions(strata_deepseek_v4_runtime PUBLIC STRATA_DEEPSEEK_WITH_MTMD=1)
 endif()
+
+include("${CMAKE_CURRENT_SOURCE_DIR}/../glm5_next/runtime.cmake")
 
 # In the unified Strata build this is an internal model component of the one
 # strata executable.  Probe/benchmark executables remain standalone-only.
@@ -285,3 +296,4 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/benchmark.cpp")
         target_include_directories(strata-hc-coeff-bench PRIVATE "${STRATA_LLAMA_SOURCE_DIR}/src")
     endif()
 endif()
+

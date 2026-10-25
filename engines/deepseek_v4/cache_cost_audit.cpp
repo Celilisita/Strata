@@ -10,7 +10,7 @@ bool cache_cost_audit_requested() {
     throw std::runtime_error("cache cost trace must be0 or1");
 }
 CacheCostAudit::CacheCostAudit(size_t keys) : history_(keys) {
-    if (!keys || keys > 11264) throw std::runtime_error("D4 fill audit exceeds its fixed bound");
+    if (!keys || keys > 64*288) throw std::runtime_error("expert fill audit exceeds its fixed bound");
 }
 void CacheCostAudit::plan() { ++costs_.plans; }
 void CacheCostAudit::fill(int key, int evicted, uint32_t incoming, uint32_t outgoing) {

@@ -1671,7 +1671,10 @@ int main(int argc, char** argv) {
         else if (a == "--seed") { o.seed = (uint64_t) std::atoll(next("--seed")); o.greedy = false; }
         else if (a == "--top-k") o.top_k = std::atoi(next("--top-k"));
         else if (a == "--top-p") o.top_p = (float) std::atof(next("--top-p"));
-        else if (a == "--temperature") o.temperature = (float) std::atof(next("--temperature"));
+        else if (a == "--temperature") {
+            o.temperature = (float) std::atof(next("--temperature"));
+            o.greedy = o.temperature <= 0.0f;
+        }
         else if (a == "--dump-logits") o.dump_logits = next("--dump-logits");
         else if (a == "--logits-stride") {
             if (have_logits_stride) { std::fprintf(stderr, "--logits-stride must be supplied only once\n"); return 2; }
@@ -8120,6 +8123,7 @@ int main(int argc, char** argv) {
                     }
                 }).detach();
         }
+        std::printf("INFO prefill_chunk=%lld\n", (long long) o.prefill_chunk);
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
         std::fflush(stdout);
         std::string line;

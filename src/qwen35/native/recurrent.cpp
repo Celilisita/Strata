@@ -1,7 +1,24 @@
+#include "q8_f32_input_policy.hpp"
+#include "q35_four_projection_policy.hpp"
+#include "q36_ab_nvfp4_policy.hpp"
+#include "q35_q36_tiny_four_projection_policy.hpp"
+#include "ffn_down_add.hpp"
+#include "fp4_residual_norm_scope.hpp"
+#include "inputnorm_scope.hpp"
+#include "gdn_weighted_qk_policy.hpp"
+#include "gdn_output_elision_policy.hpp"
+#include "tiny_parameter_pair.hpp"
+#include "tiny_parameter_pair_policy.hpp"
+#include "operator_fusion_policy.hpp"
+#include "conv_gdn_fused.hpp"
+#include "conv_gdn_policy.hpp"
 #include "strata/qwen35/native/tiny_batch.hpp"
 #include "strata/qwen35/native/small_prefill.hpp"
 #include "strata/qwen35/native/recurrent.hpp"
+#include "strata/qwen35/native/q8_projection.hpp"
+#include "q8_pp_sgemm.hpp"
 #include "strata/qwen35/native/dense_gemm.hpp"
+#include "strata/qwen35/native/nvfp4_runtime.hpp"
 #include "strata/qwen35/native/gdn.hpp"
 #include "strata/qwen35/native/ops.hpp"
 #include "small_qkv32_cache.hpp"
@@ -21,6 +38,8 @@ RecurrentLayer::RecurrentLayer(RecurrentWeights w, RecurrentShape s, int splits,
     const bool code_ffn=w.ffn_down.layout==BlockLayout::Q6Codes;
     if(w.qkv.layout==BlockLayout::Q6Codes&&(!code_ffn||s.max_tokens!=32))throw std::invalid_argument("byte-code QKV layer admission is prepared PP32 only");
     if(code_ffn && s.max_tokens!=32)throw std::invalid_argument("prepared FFN layer admission is PP32 only");
+    if ((w.alpha.quant == Quant::Q8) != (w.beta.quant == Quant::Q8))
+        throw std::invalid_argument("Q8 GDN alpha/beta must use one paired format");
     const Matrix matrices[] = {w.qkv, w.z, w.alpha, w.beta, w.out, w.ffn_gate, w.ffn_up, w.ffn_down};
     for(int i=0;i<8;++i)matrix_bytes(matrices[i],i==7||(i==0&&w.qkv.layout==BlockLayout::Q6Codes),false,i==5||i==6);
     if (w.qkv.rows != channels || w.z.rows != inner || w.alpha.rows != s.value_heads || w.beta.rows != s.value_heads ||
@@ -148,6 +167,14 @@ void RecurrentLayer::project_native32(const float *input,std::initializer_list<N
                                           {projection_partials_,partial_rows_capacity_*32*4},false);
     }
 }
+void RecurrentLayer::project_shared_nvfp4(const float* input,std::initializer_list<Nvfp4Projection> projections,int tokens,cudaStream_t stream){
+    if(!pp_gemm_||tokens<1||tokens>shape_.max_tokens)throw std::invalid_argument("shared NVFP4 projection runtime/span");
+    for(const auto& p:projections){matrix_bytes(p.weight);
+        if(p.weight.columns>input_capacity_||size_t(p.weight.rows)*p.weight.columns>decoded_capacity_)
+            throw std::invalid_argument("shared NVFP4 projection staging exceeded");
+    }
+    nvfp4_project_set(*pp_gemm_,input,projections,tokens,stream);
+}
 void RecurrentLayer::enable_q4_projection32(cudaStream_t stream,bool norm_pair,bool fused_ops){
     if((fused_ops&&!norm_pair)||q4projection32_||shape_.max_tokens!=32||tg_||!qkv32_||qkv32_extra_submissions_!=1)
         throw std::invalid_argument("Q4 projection stage requires explicit complete QKV and prepared FFN PP32 admission");
@@ -167,6 +194,10 @@ void RecurrentLayer::project(Matrix w, const void *input, float *output, int tok
        (tokens>=64 && active_parts>1 && size_t(w.rows)*active_parts*size_t(tokens)>
         partial_rows_capacity_*size_t(shape_.max_tokens)))
         throw std::invalid_argument("shared projection staging exceeded");
+    if(w.quant==Quant::NVFP4){
+        if(!pp_gemm_)throw std::logic_error("NVFP4 projection runtime missing");
+        nvfp4_project(*pp_gemm_,w,static_cast<const float *>(input),output,tokens,stream);return;
+    }
     if (tokens == 1) vector_linear(w, input, output, stream);
     else if(tiny_batches(tokens))tiny_batch_linear(w,input,output,tokens,stream);
     else if(tokens<64)small_prefill_linear(w,input,output,tokens,stream,pp_->multiprocessors());
@@ -187,6 +218,12 @@ void RecurrentLayer::project(Matrix w, const void *input, float *output, int tok
         else dense_linear(scratch.half_weights, input, output, w.rows, w.columns, tokens, stream);
     }
 }
+bool RecurrentLayer::parameter_pair_eligible(int tokens)const{
+    const auto &a=weights_.alpha,&b=weights_.beta;
+    return tiny_parameter_pair_request().enabled&&tokens==3&&tiny_batches(tokens)&&
+        a.quant==Quant::Q4K&&b.quant==Quant::Q4K&&a.layout==BlockLayout::Q4Pairs&&b.layout==BlockLayout::Q4Pairs&&
+        a.rows==48&&b.rows==48&&a.columns==5120&&b.columns==5120;
+}
 void RecurrentLayer::execute(RecurrentInputs input, RecurrentStateOutputs next, int tokens, cudaStream_t stream,const PhaseMarks *marks) {
     const auto &s = shape_; const auto &w = weights_; auto &b = buffers_;
     if(!tg_ && tokens!=32)throw std::invalid_argument("prepared FFN layer supports admitted PP32 service only");
@@ -202,11 +239,28 @@ void RecurrentLayer::execute(RecurrentInputs input, RecurrentStateOutputs next, 
     const int inner = s.dim * s.value_heads, channels = s.dim * (2 * s.query_heads + s.value_heads);
     const auto &scratch = vector ? tg_->buffers() : pp_->buffers();
     mark(0);
-    void *joint_q6=packed?(qkv32_?qkv32_->encoding_input(stream):scratch.half_weights):nullptr;
-    if(packed)q4projection32_->prepare_rms(input.hidden,w.norm,b.norm,nullptr,s.hidden,1,s.epsilon,joint_q6,stream);
-    else rms_norm(input.hidden, w.norm, b.norm, s.hidden, tokens, s.epsilon, stream);
     void *prepared = vector ? scratch.quant_input : scratch.half_input;
-    if(packed){}
+    bool alpha_beta_done=false;
+    {
+    void *joint_q6=packed?(qkv32_?qkv32_->encoding_input(stream):scratch.half_weights):nullptr;
+    const bool share_nv=w.qkv.quant==Quant::NVFP4&&w.z.quant==Quant::NVFP4&&nvfp4_shared_projections_enabled();
+    const bool legacy_projection=packed||active_q4||marks;
+    const bool tiny_four_projection=q35_q36_tiny_four_projection_eligible(w,share_nv,legacy_projection,s.hidden,tokens);
+    const bool four_projection=q35_four_projection_eligible(w,share_nv,legacy_projection,s.hidden,tokens)||
+        q36_ab_four_projection_eligible(w,share_nv,legacy_projection,s.hidden,tokens)||tiny_four_projection;
+    const bool input_norm_closed=!marks&&share_nv&&w.alpha.quant==Quant::Q4K&&w.beta.quant==Quant::Q4K&&
+        w.alpha.layout==BlockLayout::Q4Pairs&&w.beta.layout==BlockLayout::Q4Pairs&&w.alpha.rows==48&&w.beta.rows==48&&
+        w.alpha.columns==5120&&w.beta.columns==5120;
+    InputNormScope input_norm(input_norm_closed,input.hidden,w.norm,b.norm,prepared,s.hidden,tokens,s.epsilon,stream);
+    if(packed)q4projection32_->prepare_rms(input.hidden,w.norm,b.norm,nullptr,s.hidden,1,s.epsilon,joint_q6,stream);
+    else if(!input_norm.deferred())rms_norm(input.hidden, w.norm, b.norm, s.hidden, tokens, s.epsilon, stream);
+    // Every initial projection consumes b.norm F32 in this exact inventory.
+    // Keep RMS/b.norm materialization; only the unconsumed legacy encoding goes.
+    const bool f32_only=q8_f32_input_eligible(w,share_nv,packed||active_q4||marks,s.hidden)||four_projection||
+        q36_ab_f32_input_eligible(w,share_nv,legacy_projection,s.hidden);
+    if(input_norm.deferred()){}
+    else if(packed){}
+    else if(f32_only){}
     else if (vector) vector_quantize(b.norm, prepared, s.hidden, stream);
     else if(active_q4&&q4_norm_pair_)q4projection32_->prepare(b.norm,s.hidden,stream);
     else if(tiny_batches(tokens))tiny_batch_quantize(b.norm,prepared,s.hidden,tokens,stream);
@@ -214,7 +268,16 @@ void RecurrentLayer::execute(RecurrentInputs input, RecurrentStateOutputs next, 
     else to_half(b.norm, prepared, size_t(s.hidden) * tokens, stream);
     if(active_q4&&!q4_norm_pair_)q4projection32_->prepare(b.norm,s.hidden,stream);
     mark(1);
-    if(native32_&&tokens==32){
+    if(four_projection){
+        // Runtime owns the complete four-view lease. It preserves each weight
+        // global and re-encodes if an actual input scale/codec kind differs.
+        project_shared_nvfp4(b.norm,{{w.qkv,b.qkv,nullptr},{w.z,b.z,nullptr},
+            {w.alpha,b.alpha,nullptr},{w.beta,b.beta_raw,nullptr}},tokens,stream);
+        alpha_beta_done=true;
+    }
+    else if(share_nv)project_shared_nvfp4(b.norm,{{w.qkv,b.qkv,marks?(*marks)[2]:nullptr},
+        {w.z,b.z,marks?(*marks)[3]:nullptr}},tokens,stream);
+    else if(native32_&&tokens==32){
         if(qkv32_)qkv32_->execute(w.qkv,b.norm,b.qkv,stream,packed);
         else{
         const void *qkv_input=q4projection32_->prepared_input(s.hidden,stream);
@@ -228,23 +291,40 @@ void RecurrentLayer::execute(RecurrentInputs input, RecurrentStateOutputs next, 
         }
     }
     else if(qkv32_&&tokens==32)qkv32_->execute(w.qkv,b.norm,b.qkv,stream);
-    else project(w.qkv, prepared, b.qkv, tokens, schedule_.projections[0], stream);
-    mark(2);
-    if(active_q4)q4projection32_->linear(w.z,b.z,stream);
-    else project(w.z, prepared, b.z, tokens, schedule_.projections[1], stream);
-    mark(3);
-    if(active_fused)q4projection32_->small_pair(b.alpha,b.beta_raw,stream);
+    else project(w.qkv, w.qkv.quant==Quant::NVFP4?b.norm:prepared, b.qkv, tokens, schedule_.projections[0], stream);
+    if(!share_nv){
+        mark(2);
+        if(active_q4)q4projection32_->linear(w.z,b.z,stream);
+        else project(w.z,w.z.quant==Quant::NVFP4?b.norm:prepared,b.z,tokens,schedule_.projections[1],stream);
+        mark(3);
+    }
+    input_norm.verify(); // Required projection operands and any legacy FP16 view are submitted.
+    } // End the host descriptor before later providers reuse the shared service.
+    if(alpha_beta_done){} // All four outputs are already enqueued on the ordered stream.
+    else if(w.alpha.quant==Quant::Q8){
+        // TG/MTP tiny work reaches the original kernel before any aux lookup,
+        // CUDA capture query, readiness scan or F32-cache validation.
+        if(tokens<256||!pp_gemm_||!nvfp4_q8_pp_pair(*pp_gemm_,w.alpha,w.beta,b.norm,b.alpha,b.beta_raw,tokens,stream))
+            q8_projection_pair(w.alpha,w.beta,b.norm,b.alpha,b.beta_raw,tokens,stream);
+    }
+    else if(active_fused)q4projection32_->small_pair(b.alpha,b.beta_raw,stream);
     else if(active_q4&&q4_norm_pair_){q4projection32_->linear(w.alpha,b.alpha,stream);q4projection32_->linear(w.beta,b.beta_raw,stream);}
-    else{project(w.alpha, prepared, b.alpha, tokens, schedule_.projections[2], stream);
-         project(w.beta, prepared, b.beta_raw, tokens, schedule_.projections[3], stream);}
+    else if(parameter_pair_eligible(tokens))tiny_batch_parameter_pair(w.alpha,w.beta,prepared,b.alpha,b.beta_raw,tokens,stream);
+    else{project(w.alpha, w.alpha.quant==Quant::NVFP4?b.norm:prepared, b.alpha, tokens, schedule_.projections[2], stream);
+         project(w.beta, w.beta.quant==Quant::NVFP4?b.norm:prepared, b.beta_raw, tokens, schedule_.projections[3], stream);}
     mark(4);
-    causal_conv4(b.qkv, input.conv_history, w.conv, b.conv_raw, b.conv_silu, next.conv_history, channels, tokens, stream);
+    const bool fused_conv=!marks&&w.qkv.quant==Quant::NVFP4&&s.dim==128&&use_conv_gdn(tokens,s.query_heads,s.value_heads);
+    if(fused_conv)conv_gdn_fused({b.qkv,input.conv_history,w.conv,b.alpha,b.beta_raw,w.dt,w.a},
+        {b.q,b.k,b.v,b.g,b.beta,next.conv_history},s.query_heads,s.value_heads,tokens,s.epsilon,stream);
+    else causal_conv4(b.qkv, input.conv_history, w.conv, b.conv_raw, b.conv_silu, next.conv_history, channels, tokens, stream);
     if(next.prefix.state[0])conv_prefix_history(b.qkv,input.conv_history,next.prefix,channels,tokens,stream);
-    if(active_fused)gdn_prepare(b.conv_silu,b.alpha,b.beta_raw,w.dt,w.a,b.q,b.k,b.v,b.g,b.beta,
+    if(!fused_conv){
+    if(active_fused||(w.qkv.quant==Quant::NVFP4&&use_native_operator_fusion(0,tokens)))gdn_prepare(b.conv_silu,b.alpha,b.beta_raw,w.dt,w.a,b.q,b.k,b.v,b.g,b.beta,
                               s.dim,s.query_heads,s.value_heads,tokens,s.epsilon,stream);
     else {
     gdn_split(b.conv_silu, b.q, b.k, b.v, s.dim, s.query_heads, s.value_heads, tokens, s.epsilon, stream);
     gdn_parameters(b.alpha, b.beta_raw, w.dt, w.a, b.g, b.beta, s.value_heads, tokens, stream);
+    }
     }
     if(next.prefix.state[0])
         gdn_recurrence_prefix({b.q,b.k,b.v,b.g,b.beta,input.state},
@@ -252,19 +332,28 @@ void RecurrentLayer::execute(RecurrentInputs input, RecurrentStateOutputs next, 
     else if(tokens>=64&&pp_gdn_kernel_){
         const GdnShape shape{s.dim,s.dim,s.query_heads,s.value_heads,tokens};
         const size_t bytes=pp_->half_weight_capacity();
-        if(pp_gdn_workspace_(shape)>bytes)throw std::runtime_error("PP GDN exceeds idle decoded-weight lease");
-        pp_gdn_kernel_({b.q,b.k,b.v,b.g,b.beta,input.state},shape,b.attention,next.state,
-                       scratch.half_weights,bytes,stream);
+        const bool weighted_closed=!marks&&pp_gdn_kernel_==service_gdn_float_value&&pp_gdn_workspace_==service_gdn_float_workspace;
+        if(!try_gdn_weighted_qk({b.q,b.k,b.v,b.g,b.beta,input.state},shape,b.attention,next.state,scratch.half_weights,bytes,
+                              b.gated,size_t(s.max_tokens)*inner*4,stream,weighted_closed)){
+            if(pp_gdn_workspace_(shape)>bytes)throw std::runtime_error("PP GDN exceeds idle decoded-weight lease");
+            pp_gdn_kernel_({b.q,b.k,b.v,b.g,b.beta,input.state},shape,b.attention,next.state,
+                           scratch.half_weights,bytes,stream);
+        }
     }
     else if(tokens>=64&&pp_gdn_rows_==4)
         gdn_recurrence_rows({b.q,b.k,b.v,b.g,b.beta,input.state},
                            {s.dim,s.dim,s.query_heads,s.value_heads,tokens},b.attention,next.state,4,stream);
     else gdn_recurrence({b.q, b.k, b.v, b.g, b.beta, input.state},
                         {s.dim, s.dim, s.query_heads, s.value_heads, tokens}, b.attention, next.state, stream);
+    {
+    const bool direct_out=w.out.quant==Quant::NVFP4&&nvfp4_shared_projections_enabled();
+    GdnOutputElisionRequestScope output_scope(pp_gemm_,w.out,b.attention,w.gdn_norm,b.z,b.gated,tokens,s.epsilon,stream,
+        !marks&&!packed&&!active_q4&&direct_out&&s.hidden==5120&&s.dim==128&&s.value_heads==48,
+        size_t(s.max_tokens)*inner*4);
     if(packed)q4projection32_->prepare_rms(b.attention,w.gdn_norm,b.gated,b.z,s.dim,s.value_heads,s.epsilon,nullptr,stream);
-    else rms_norm(b.attention, w.gdn_norm, b.gated, s.dim, s.value_heads * tokens, s.epsilon, stream, b.z);
+    else if(!output_scope.deferred())rms_norm(b.attention, w.gdn_norm, b.gated, s.dim, s.value_heads * tokens, s.epsilon, stream, b.z);
     mark(5);
-    if(packed){}
+    if(packed||direct_out){}
     else if (vector) vector_quantize(b.gated, prepared, inner, stream);
     else if(active_q4)q4projection32_->prepare(b.gated,inner,stream);
     else if(tiny_batches(tokens))tiny_batch_quantize(b.gated,prepared,inner,tokens,stream);
@@ -272,18 +361,27 @@ void RecurrentLayer::execute(RecurrentInputs input, RecurrentStateOutputs next, 
     else to_half(b.gated, prepared, size_t(inner) * tokens, stream);
     mark(6);
     if(active_q4)q4projection32_->linear(w.out,b.projected,stream);
-    else project(w.out, prepared, b.projected, tokens, schedule_.projections[4], stream);
+    else project(w.out, w.out.quant==Quant::NVFP4?b.gated:prepared, b.projected, tokens, schedule_.projections[4], stream);
     mark(7);
-    if(active_fused)add_rms_norm(b.projected,input.hidden,w.post_norm,b.residual,b.post_norm,s.hidden,tokens,s.epsilon,stream);
+    output_scope.verify();
+    } // End the one-consumer codec lease before FFN reuses the Runtime input arena.
+    ResidualNormScope norm_scope(!marks&&w.ffn_gate.quant==Quant::NVFP4,b.projected,input.hidden,w.post_norm,b.residual,b.post_norm,
+        s.hidden,tokens,s.epsilon,stream,active_fused||(w.out.quant==Quant::NVFP4&&use_native_operator_fusion(1,tokens)));
+    if(!norm_scope.deferred()){
+    if(active_fused||(w.out.quant==Quant::NVFP4&&use_native_operator_fusion(1,tokens)))add_rms_norm(b.projected,input.hidden,w.post_norm,b.residual,b.post_norm,s.hidden,tokens,s.epsilon,stream);
     else {
     add(b.projected, input.hidden, b.residual, size_t(s.hidden) * tokens, stream);
     rms_norm(b.residual, w.post_norm, b.post_norm, s.hidden, tokens, s.epsilon, stream);
     }
+    }
     mark(8);
     Ffn &ffn = *(vector ? tg_ : pp_);
+    DownAddScope down_scope(!marks&&w.ffn_gate.quant==Quant::NVFP4&&s.hidden==5120&&w.ffn_gate.rows==17408,
+        b.residual,b.output,ffn.buffers().output,tokens,stream);
     ffn.execute(b.post_norm, tokens, stream);
+    norm_scope.verify();down_scope.verify();
     mark(9);
-    add(ffn.buffers().output, b.residual, b.output, size_t(s.hidden) * tokens, stream);
+    if(!down_scope.consumed())add(ffn.buffers().output, b.residual, b.output, size_t(s.hidden) * tokens, stream);
     mark(10);
 }
 }

@@ -1,4 +1,5 @@
 #include "strata/qwen35moe/runtime.hpp"
+#include "strata/qwen35moe/nvfp4_prefix_rows.hpp"
 #include "session_state.hpp"
 #include "session_cache_view.hpp"
 #include "strata/qwen35moe/cuda_kernels.hpp"
@@ -27,8 +28,12 @@ void Runtime::batch_attention(LayerWeights& layer, int count, int position_base)
     const char* bulk = std::getenv("STRATA_QWEN35_BATCH_ATTN");
     if (bulk && std::string(bulk) != "control" && std::string(bulk) != "1")
         throw std::invalid_argument("BATCH_ATTN must be control or1");
+    const char* setting = std::getenv("STRATA_BENCH_ATTN_MIN_ROWS");
+    const int minimum = setting ? std::stoi(setting) : 1024;
+    if (minimum != 256 && minimum != 1024)
+        throw std::invalid_argument("attention minimum requires256 or1024");
     if (bulk && std::string(bulk) == "1" && !decode_phase_ && !paired_session_ &&
-        tile_attention_ && count >= 1024) {
+        tile_attention_ && (count >= minimum || (nvfp4_&&nvfp4_prefix_detail::small(count)))) {
         batch_attention_prefill(layer, count, position_base);
         return;
     }

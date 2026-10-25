@@ -6,6 +6,7 @@
 
 #ifdef STRATA_DEEPSEEK_V4
 int strata_deepseek_v4_serve(int argc, char** argv);
+int strata_glm5_next_serve(int argc, char** argv);
 #endif
 
 #ifdef STRATA_QWEN35_MOE
@@ -37,6 +38,7 @@ inline std::optional<int> dispatch_model(int argc, char** argv) {
     constexpr ModelProvider providers[] = {{"", nullptr},
 #ifdef STRATA_DEEPSEEK_V4
         {"deepseek_v4", strata_deepseek_v4_serve},
+        {"glm5_next", strata_glm5_next_serve},
 #endif
 #ifdef STRATA_QWEN35_MOE
         {"qwen35_moe", strata_qwen35_moe_serve},

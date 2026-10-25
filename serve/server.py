@@ -609,9 +609,19 @@ class StrataEngine:
 
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
                  env: dict | None = None, lazy: bool = False):
+        # #1012: the admission state belongs to the server, not to one engine process.  restart() runs this again
+        # while requests still wait on it (they hold these very objects), so it is made once and kept: new ones
+        # would leave the waiters on a lock and a condition nobody notifies, with their counts missing from the
+        # new lists.
+        if "slot_cv" not in self.__dict__:
+            self.slot_cv = threading.Condition()
+            self.waiting = 0                            # requests waiting for the control lines (ctl)
+            self.wait_lens: list[list[int]] = []        # ... their prompt lengths (a long read gives way to short ones)
+            self.ctl_epoch = 0                          # how often the control lines were taken
+            self.ctl = threading.Lock()                 # one admission or solo request on the control lines at a time
         self.spawn = (exe, list(args), cwd, log, env)   # to start it again after it died (issue #27)
-        paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
-        self.model_path = paths.get("--native") or paths.get("--pack", "pack/full")
+        paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack", "--model")}
+        self.model_path = paths.get("--model") or paths.get("--native") or paths.get("--pack", "pack/full")
         self.log_path = log
         self.proc, self.pump, self.log = None, None, None
         self.ended, self.unloaded = True, True
@@ -736,16 +746,6 @@ class StrataEngine:
         self.slot_held: list[list[int]] = [[] for _ in range(self.batch)]
         self.slot_used = [0.0] * self.batch
         self.slot_live: list[dict | None] = [None] * self.batch   # /metrics: the request in each slot
-        # #1012: the admission state belongs to the server, not to one engine process.  restart() runs this again
-        # while requests still wait on it (they hold these very objects), so it is made once and kept: new ones
-        # would leave the waiters on a lock and a condition nobody notifies, with their counts missing from the
-        # new lists.
-        if "slot_cv" not in self.__dict__:
-            self.slot_cv = threading.Condition()
-            self.waiting = 0                            # requests waiting for the control lines (ctl)
-            self.wait_lens: list[list[int]] = []        # ... their prompt lengths (a long read gives way to short ones)
-            self.ctl_epoch = 0                          # how often the control lines were taken
-            self.ctl = threading.Lock()                 # one admission or solo request on the control lines at a time
         self.gen = self.__dict__.get("gen", 0) + 1      # which engine process this is (a request notes its own)
         self._ctl_erred = False                         # #1059: the control lines ended on an ERR
         self._yielded = None                            # (slot, tokens read): the last request on them gave way
@@ -1834,6 +1834,10 @@ class Vision:
         (a %TEMP% under a user name with a space) broke every image.  The system temp directory is used while its path
         has no space, then the working directory, then the system drive's root; the plain temp directory is the last
         resort (the encoder's own files are then named relative to it, see `_start`)."""
+        if os.environ.get("STRATA_TEMP_ROOT"):
+            root = Path(os.environ["STRATA_TEMP_ROOT"])
+            root.mkdir(parents=True, exist_ok=True)
+            return Path(tempfile.mkdtemp(prefix="strata-vision-", dir=root))
         for parent in (None, Path.cwd(), Path(os.environ.get("SystemDrive", "C:") + os.sep)):
             try:
                 d = Path(tempfile.mkdtemp(prefix="strata-vision-", dir=parent))
@@ -2475,15 +2479,20 @@ class Detokenizer:
 
     def __init__(self, tok):
         self.tok, self.ids, self.sent = tok, [], 0
+        self.native = tok.incremental_decoder() if getattr(tok, "pre", None) == "gemma4" else None
         self.inc = codecs.getincrementaldecoder("utf-8")(errors="replace") if hasattr(tok, "token_bytes") else None
 
     def pending(self) -> bool:
         """A character is split across the tokens so far: its first bytes are held."""
+        if self.native is not None:
+            return self.native.pending()
         if self.inc is not None:
             return bool(self.inc.getstate()[0])
         return self.tok.decode(self.ids).endswith("\ufffd")
 
     def push(self, t: int) -> str:
+        if self.native is not None:
+            return self.native.push(t)
         if self.inc is not None:
             return self.inc.decode(self.tok.token_bytes(t))
         self.ids.append(t)
@@ -2598,10 +2607,12 @@ def slot_save_dir(value, base: str | None = None) -> str:
 class Service:
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
-                 fit_max_tokens: bool = False):
+                 fit_max_tokens: bool = False, max_output: int | None = None):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
         self.literals = literal_tags(getattr(tokenizer, "control_tokens", ()))   # texts that stay text inside a message
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
+        from serve.output_limits import configured_limit
+        self.max_output = configured_limit(max_output)
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
         self.reasoning_close_retry = False            # #1053 (opt-in): close the thinking once when a reply ends inside it
         self.codex_compaction_cache = False           # #924 (opt-in): a Codex compaction is rendered with its conversation's tools
@@ -2660,10 +2671,15 @@ class Service:
         self.vram_reserve = None                         # #533: the last POST /v1/vram reserve (None: the start's)
         self.reasoning_loop_recovery = False
         self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
+        self.reasoning_close = REASONING_CLOSE           # what closes the thinking at its budget (#123)
+        self.reasoning_wrap_up = REASONING_WRAP_UP       # the wrap-up the budget writes before that close (#123)
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply (0: off)
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
         self.tool_call_recovery = False                   # opt-in: tool calls in forms next to the template's
-        if getattr(tokenizer, "pre", None) == "joyai-llm":
+        if getattr(tokenizer, "pre", None) == "glm4":
+            from serve.glm5_next import stop_ids
+            self.stop_ids = stop_ids(tokenizer)
+        elif getattr(tokenizer, "pre", None) == "joyai-llm":
             eos = tokenizer.special_ids.get("tokenizer.ggml.eos_token_id")
             self.stop_ids = {int(eos)} if eos is not None else set()
         else:
@@ -2989,8 +3005,8 @@ class Service:
         """The hardware sampler behind GET /metrics (serve/telemetry.py), recording this server's tok/s too."""
         if getattr(self, "telemetry", None) is None:
             from serve.telemetry import Telemetry
-            self.telemetry = Telemetry(extra=lambda: {"tok_s": self._tok_s(), "tok_s_mean": self._tok_s_mean(),
-                                                    "prefill_tok_s_mean": self._prefill_tok_s_mean()},
+            from serve.prefill_metrics import rates
+            self.telemetry = Telemetry(extra=lambda: rates(self),
                                        gpu_index=int(getattr(self, "gpu_index", 0) or 0),
                                        gpu_indices=getattr(self, "gpu_indices", None),
                                        amd=getattr(self, "backend", None) == "hip")
@@ -3033,7 +3049,8 @@ class Service:
         """Engine-reported mean over newly read tokens, excluding the cached prefix."""
         with self.status_lock:
             reading = self.status.get("busy") and self.status.get("first_token") is None
-        return getattr(self.engine, "prefill_tok_s_mean", None) if reading else 0.0
+        from serve.prefill_metrics import view
+        return view(self).get("prefill_tok_s_mean") if reading else 0.0
 
     def begin_request(self, path, req):
         """#332: a monitor record for this request, or None when the monitor is off (nothing is kept then)."""
@@ -3094,6 +3111,8 @@ class Service:
                 "tok_s_mean": round(self._tok_s_mean(), 1) if state == "generating" else None,
                 "prefill_tok_s_mean": getattr(self.engine, "prefill_tok_s_mean", None) if s.get("busy") else None,
                 "tok_s_window_s": RATE_WINDOW_S if state == "generating" else None}
+        from serve.prefill_metrics import apply as apply_prefill_metrics
+        apply_prefill_metrics(self, live, s)
         if state == "reading" and progress:
             live["prompt_read"], live["prompt_total"] = progress
         par = int(getattr(self.engine, "batch", 0) or 0)
@@ -3220,6 +3239,10 @@ class Service:
                     content[n] = {"type": "text", "text": f"[image omitted: {why}]"}
         return fetched
 
+    def output_limit(self, maximum):
+        from serve.output_limits import resolve_limit
+        return resolve_limit(maximum, self.max_output)
+
     def prepare(self, messages, tools, kwargs, max_new=None, force=None, req=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context.  `force` (forced_call): without thinking the reply starts with it, so it ends the
@@ -3229,6 +3252,7 @@ class Service:
             # Keep the DeepSeek prompt and reply parser in thinking mode by
             # default. A request may still explicitly disable it.
             kwargs = {**kwargs, "enable_thinking": True}
+        max_new = self.output_limit(max_new)
         fetched = self._note_unreadable_tool_images(messages)
         ids = self.encode_prompt(messages, tools, kwargs)
         if force and kwargs.get("enable_thinking", True) is False:
@@ -3240,7 +3264,8 @@ class Service:
                 raise ValueError("this server was started without the vision encoder (run setup again and choose "
                                  "'vision'), so it cannot read images")
             deepseek4v = getattr(self.vision, "format", "qwen") == "deepseek4v"
-            if not deepseek4v:
+            glm5v = getattr(self.vision, "format", "qwen") == "glm5v"
+            if not deepseek4v and not glm5v:
                 pad = self.tok.encode(IMAGE_PAD, parse_special=True)[0]
                 start = self.tok.encode(VISION_START, parse_special=True)[0]
             # An image URL is downloaded first, outside the FIFO: under it, a slow server held every other request
@@ -3261,6 +3286,9 @@ class Service:
             if deepseek4v:
                 out, records = deepseek_vision.expand_placeholders(ids, encoded)
                 k = len(records)
+            elif glm5v:
+                from serve.glm5_next import expand_images
+                out, k = expand_images(self.tok, ids, encoded)
             else:
                 literal = self.tok.encode(IMAGE_PAD, parse_special=False)
                 for j, token in enumerate(ids):
@@ -3290,7 +3318,7 @@ class Service:
             if room < 1:
                 raise ValueError(f"prompt ({len(ids)} tokens) leaves no room to answer in the context "
                                  f"({ctx}); requests are never truncated")
-            max_new = room
+            max_new = min(room, self.max_output) if self.max_output is not None else room
         elif max_new > room:
             if not self.fit_max_tokens:
                 raise ValueError(f"prompt ({len(ids)} tokens) + max tokens ({max_new}) exceeds the context "
@@ -3423,7 +3451,12 @@ class Service:
         if s.get("first_token") is None:
             pr = getattr(self.engine, "progress", None)   # (position reached, prompt tokens): a reused prefix counts
             done = f"{pr[0]:,} of {pr[1]:,}" if pr and pr[1] else f"{s.get('prompt_tokens', 0):,}"   # as read (#29)
-            print(f"[strata] reading the prompt: {done} tokens, {el:.0f} s so far", flush=True)
+            speed = ""
+            meter = getattr(self.engine, "prefill_meter", None)
+            current = meter.snapshot().get("current") if meter is not None else None
+            if current:
+                speed = f", {current:,.0f} tok/s"
+            print(f"[strata] reading the prompt: {done} tokens, {el:.0f} s so far{speed}", flush=True)
         else:
             rate = s["generated"] / max(1e-6, now - s["first_token"])
             print(f"[strata] {s['phase']}: {s['generated']} of max {s.get('max_tokens')} tokens, {rate:.1f} tok/s, "
@@ -3633,7 +3666,7 @@ class Service:
                             # #1053: the model wrote its reasoning and stopped before </think>: the client would get
                             # an empty answer.  Close the thinking once and let it answer.
                             close_retried = True
-                            extra = self.tok.encode(REASONING_CLOSE, parse_special=True)
+                            extra = self.tok.encode(self.reasoning_close, parse_special=True)
                             if max_new - n - len(extra) >= 1:
                                 print("[strata] the reply ended inside its thinking with no answer: closing the "
                                       "thinking once and continuing (reasoning_close_retry)", flush=True)
@@ -3657,7 +3690,7 @@ class Service:
                         # thinking ended, after the blank line the template puts before a call.
                         if wrap:
                             budget = None
-                            text = REASONING_WRAP_UP + (force or "")
+                            text = self.reasoning_wrap_up + (force or "")
                         else:
                             text = "\n" * (2 - (len(tail) - len(tail.rstrip("\n")))) + force
                         force = None
@@ -4700,6 +4733,9 @@ def make_handler(svc: Service):
                         self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                     return
                 if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
+                    validate_request = getattr(svc.engine, "validate_request", None)
+                    if validate_request is not None:
+                        validate_request(req)
                     self.record = svc.begin_request(path, req)
                 if path == "/v1/responses":
                     self._responses(req)
@@ -4974,8 +5010,8 @@ def make_handler(svc: Service):
             messages, validator = prepare_format(req.get("response_format"), messages)
             if validator is not None and (tools or req.get("strata_mcp")):
                 raise ValueError("structured response_format with tools/MCP is not supported")
+            max_req = max_new = svc.output_limit(int(req.get("max_completion_tokens") or req.get("max_tokens") or 0))
             svc.load()
-            max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
             use_mcp = req.get("strata_mcp") is True and svc.mcp is not None      # the web app's opt-in (serve/mcp.py)
             own = {t.get("name") for t in tools or [] if isinstance(t, dict)}   # #592: a second line of defence
             if use_mcp:
@@ -5158,18 +5194,22 @@ def make_handler(svc: Service):
                 stop_strings(req)
             except ValueError as e:
                 raise ResponsesError(str(e), "stop") from None
+            try:
+                maximum = svc.output_limit(req.get("max_output_tokens") or 0)
+            except ValueError as e:
+                raise ResponsesError(str(e), "max_output_tokens") from None
             svc.load()
             # #924 (opt-in): a Codex compaction request is rendered with its conversation's tools, so its prompt
             # starts as the cached one did; the parser and the response keep the request's own tools
             shown = responses_api.prompt_tools(req, tools) if svc.codex_compaction_cache else tools
             try:
                 try:
-                    ids, thinking, max_new = svc.prepare(messages, shown, kw, req.get("max_output_tokens") or 0, req=req)
+                    ids, thinking, max_new = svc.prepare(messages, shown, kw, maximum, req=req)
                 except ValueError:
                     if shown is tools:
                         raise
                     shown = tools                            # too long with the kept tools: the request as sent
-                    ids, thinking, max_new = svc.prepare(messages, shown, kw, req.get("max_output_tokens") or 0, req=req)
+                    ids, thinking, max_new = svc.prepare(messages, shown, kw, maximum, req=req)
             except ResponsesError:
                 raise
             except ValueError as e:                          # too long for the context, an image without vision
@@ -5193,14 +5233,14 @@ def make_handler(svc: Service):
             self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw))})
 
         def _anthropic(self, req):
-            svc.load()
             req = svc.with_shared(req, "anthropic")
+            max_new = svc.output_limit(int(req.get("max_tokens") or 0))
+            svc.load()
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
             self._no_local_images(messages)
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # Anthropic's {"type": "none"}: no tools offered
                 tools = None
             force = forced_call(req.get("tool_choice"), tools, dialect=getattr(svc.template, "tool_dialect", None))        # "any" / {"type": "tool", "name": N}
-            max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req)
@@ -5688,11 +5728,29 @@ def main() -> int:
         ap.error(listen_problem(a.host, a.port, e))
     if cfg.get("tokenizer"):
         a.tokenizer = cfg["tokenizer"]
-    tok = ByteTokenizer()
+    from serve.dense_family import (configured as dense_configured, frontend_for_config,
+                                    DenseFamilyEngine, DenseTemplate)
+    small_dense = a.engine == "strata" and dense_configured(cfg)
+    from serve.gemma_family import (configured as gemma_configured,
+        frontend_for_config as gemma_frontend_for_config, GemmaFamilyEngine)
+    from serve.gemma_sm120_service import (configured as gemma_sm120_configured,
+        frontend_for_config as gemma_sm120_frontend_for_config, GemmaSm120Engine, GemmaSm120Service)
+    from serve.gemma_sm120_frontend import GemmaTemplate as GemmaSm120Template
+    gemma_sm120 = a.engine == "strata" and gemma_sm120_configured(cfg)
+    gemma_dense = a.engine == "strata" and not gemma_sm120 and gemma_configured(cfg)
+    from serve.v100_qwen_family import (configured as v100_qwen_configured,
+        frontend_for_config as v100_qwen_frontend_for_config, V100QwenEngine)
+    v100_qwen = a.engine == "strata" and v100_qwen_configured(cfg)
+    dense_frontend = (gemma_sm120_frontend_for_config(cfg) if gemma_sm120 else
+                      v100_qwen_frontend_for_config(cfg) if v100_qwen else
+                      gemma_frontend_for_config(cfg) if gemma_dense else
+                      frontend_for_config(cfg) if small_dense else None)
+    metadata_frontend = small_dense or gemma_dense or v100_qwen or gemma_sm120
+    tok = dense_frontend.tokenizer if metadata_frontend else ByteTokenizer()
     tpath = Path(a.tokenizer)
-    if a.engine == "strata" and not (tpath / "vocab.json").exists():
+    if a.engine == "strata" and not metadata_frontend and not (tpath / "vocab.json").exists():
         ap.error(f"the model's tokenizer is missing ({tpath / 'vocab.json'}); run setup again")
-    if (tpath / "vocab.json").exists():
+    if not metadata_frontend and (tpath / "vocab.json").exists():
         import strata_tokenizer as ST
         vocab = json.loads((tpath / "vocab.json").read_text(encoding="utf-8"))
         tokens = [None] * len(vocab)
@@ -5709,20 +5767,25 @@ def main() -> int:
         if not cfg:
             ap.error("--engine strata needs --config")
         from serve.native_family import validate_config, NativeFamilyEngine
+        from serve.glm5_next import Glm5NextEngine, configured as glm_configured
         native_family = validate_config(cfg)
-        if native_family:
+        engine_type = Glm5NextEngine if glm_configured(cfg) else StrataEngine
+        if native_family or metadata_frontend:
             import tempfile
             os.environ.update(TEMP=cfg["temp_dir"], TMP=cfg["temp_dir"],
                               CUDA_VISIBLE_DEVICES=cfg["gpu_uuid"], CUDA_DEVICE_ORDER="PCI_BUS_ID")
             tempfile.tempdir = cfg["temp_dir"]
         vision = None
         env = child_env(cfg)
-        sampling_defaults = sampling_defaults_from_config(cfg)
+        sampling_defaults = (Glm5NextEngine.sampling_defaults(cfg) if engine_type is Glm5NextEngine else
+                             sampling_defaults_from_config(cfg))
+        if gemma_sm120:
+            sampling_defaults.setdefault("temperature", 0.6)
         if sampling_defaults:
             pretty = ", ".join(f"{k}={v}" for k, v in sampling_defaults.items())
             print(f"[strata] sampling defaults from the config: {pretty}", flush=True)
         lazy = a.lazy or cfg.get("lazy_load") is True
-        if cfg.get("vision"):
+        if cfg.get("vision") and not small_dense:
             print("loading the vision encoder ..." if not lazy else
                   "vision encoder unloaded; it starts with the model ...", flush=True)
             # relative paths are the config's cwd's, as for the engine below
@@ -5751,12 +5814,18 @@ def main() -> int:
         except ValueError as e:
             raise SystemExit(f"[strata] config {e}")
         try:
-            effort_end = None if native_family else effort_end_args(cfg, exe, tok)  # #458
+            effort_end = None if native_family or metadata_frontend else effort_end_args(cfg, exe, tok)  # #458
         except ValueError as e:
             raise SystemExit(f"[strata] config {e}")
-        engine = (NativeFamilyEngine(cfg, tok, env) if native_family else
-                  StrataEngine(exe, engine_args(cfg) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
-                               env=env, lazy=lazy))
+        engine = (GemmaSm120Engine(cfg, dense_frontend, env, lazy=lazy) if gemma_sm120 else
+                  V100QwenEngine(cfg, dense_frontend, env, lazy=lazy) if v100_qwen else
+                  GemmaFamilyEngine(cfg, dense_frontend, env, lazy=lazy) if gemma_dense else
+                  DenseFamilyEngine(cfg, dense_frontend, env, lazy=lazy) if small_dense else
+                  NativeFamilyEngine(cfg, tok, env) if native_family else
+                  engine_type(exe, engine_args(cfg) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
+                              env=env, lazy=lazy))
+        if small_dense:
+            vision = engine.vision
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
         warn_tight_ram(engine.info.get("arena_mib"))
         note = desktop_vram_note(cfg.get("backend"), engine.info.get("vram_free_mib"), getattr(engine, "spawn", (None, []))[1],
@@ -5770,13 +5839,27 @@ def main() -> int:
     # the model's own chat template (exported with its tokenizer), else the original model's
     tpl = tpath / "chat_template.jinja"
     service_type = Service
-    if a.engine == "strata" and native_family:
+    if gemma_sm120:
+        service_type = GemmaSm120Service
+    elif v100_qwen:
+        from serve.v100_qwen_service import V100QwenService
+        service_type = V100QwenService
+    elif gemma_dense:
+        from serve.gemma_service import GemmaFamilyService
+        service_type = GemmaFamilyService
+    elif small_dense:
+        from serve.dense_family_service import DenseFamilyService
+        service_type = DenseFamilyService
+    elif a.engine == "strata" and native_family:
         from serve.native_service import NativeFamilyService
         service_type = NativeFamilyService
-    svc = service_type(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
+    template = GemmaSm120Template(cfg["tokenizer"]) if gemma_sm120 else DenseTemplate(dense_frontend) if metadata_frontend else ChatTemplate(
+        tpl if tpl.exists() else ROOT / "serve/chat_template.jinja")
+    svc = service_type(engine, tok, template,
                   model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision,
                   sampling_defaults=sampling_defaults,
-                  fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
+                  fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True,
+                  max_output=cfg.get("max_output"))
     svc.reasoning_close_retry = cfg.get("reasoning_close_retry") is True    # #1053: opt-in, off by default
     svc.codex_thread_titles = cfg.get("codex_thread_titles") is True    # #923: opt-in, off by default
     svc.codex_compaction_cache = cfg.get("codex_compaction_cache") is True   # #924: opt-in, off by default

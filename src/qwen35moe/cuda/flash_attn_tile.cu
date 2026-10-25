@@ -2,6 +2,8 @@
 // Copyright (c) 2023-2026 The ggml authors. See flash_attn.cu for the license.
 #include "strata/qwen35moe/attention_tile.hpp"
 #include "strata/kernels/native_flash_attn.hpp"
+#include "tg_attention_join_config.cuh"
+#include "attention_pairheads4.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -213,23 +215,53 @@ size_t flash_attn_tile_scratch_bytes(int max_context) {
     return size_t(kHeads) * ((max_context + kRows - 1) / kRows) * kPartial * sizeof(float);
 }
 
-void flash_attn_tile_step(const float* q, const uint16_t* k, const uint16_t* v,
+bool flash_attn_tile_step_provider(const float* q, const uint16_t* k, const uint16_t* v,
                           const int32_t* step, int capacity, int width, float* output,
                           int32_t* status, const uint16_t* mask, float* scratch,
-                          size_t scratch_bytes, void* stream) {
+                          size_t scratch_bytes, void* stream, bool request_pairheads4) {
     if (!q || !k || !v || !step || !output || !status || !scratch || !stream ||
         width < 1 || width > capacity || capacity > kAttentionMaxContext ||
         scratch_bytes < flash_attn_tile_scratch_bytes(width))
         throw std::invalid_argument("invalid Qwen35 tile attention buffers");
+    const bool shared_join = tg_attention_shared_join_enabled() && width >= 1024;
     const int splits = (width + kRows - 1) / kRows;
+    const bool selected = request_pairheads4 && try_launch_attention_pairheads4(
+        q, k, v, step, capacity, width, splits, mask, scratch, status, stream);
+    if (!selected) {
     tile<false><<<dim3(2, splits), dim3(32, 8), 0, static_cast<cudaStream_t>(stream)>>>(
         q, reinterpret_cast<const half2*>(k), reinterpret_cast<const half2*>(v),
         step, capacity, width, splits, reinterpret_cast<const half*>(mask), scratch, status, -1, 1);
+    }
     auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
-    join<false><<<kHeads, kDim, 0, static_cast<cudaStream_t>(stream)>>>(scratch, splits, status, output);
+    if (shared_join)
+        join<false, true><<<kHeads, kDim, 0, static_cast<cudaStream_t>(stream)>>>(scratch, splits, status, output);
+    else
+        join<false><<<kHeads, kDim, 0, static_cast<cudaStream_t>(stream)>>>(scratch, splits, status, output);
     error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+    return selected;
+}
+void flash_attn_tile_step(const float* q, const uint16_t* k, const uint16_t* v,
+    const int32_t* step, int capacity, int width, float* output, int32_t* status,
+    const uint16_t* mask, float* scratch, size_t scratch_bytes, void* stream) {
+    (void)flash_attn_tile_step_provider(q, k, v, step, capacity, width, output,
+        status, mask, scratch, scratch_bytes, stream, false);
+}
+AttentionPairHeads4Resources flash_attn_tile_native_resources() {
+    // Probe-only observation; it does not impose new production eligibility.
+    static thread_local const AttentionPairHeads4Resources cached=[] {
+        AttentionPairHeads4Resources r{};r.threads=256;
+        auto check=[](cudaError_t e) {if(e!=cudaSuccess) throw std::runtime_error(cudaGetErrorString(e));};
+        check(cudaGetDevice(&r.device));cudaDeviceProp p{};check(cudaGetDeviceProperties(&p,r.device));
+        r.major=p.major;r.minor=p.minor;r.multiprocessors=p.multiProcessorCount;r.shared_limit=p.sharedMemPerBlock;
+        cudaFuncAttributes a{};check(cudaFuncGetAttributes(&a,tile<false>));
+        r.binary_version=a.binaryVersion;r.registers=a.numRegs;r.max_threads=a.maxThreadsPerBlock;
+        r.static_shared=a.sharedSizeBytes;r.local_bytes=a.localSizeBytes;
+        check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&r.active_blocks,tile<false>,256,0));
+        return r;
+    }();
+    return cached;
 }
 namespace {
 __global__ void positions(int32_t* out, int rows, int heads, int first) {

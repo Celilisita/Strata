@@ -1,10 +1,12 @@
 #include "strata/core/native_miss.hpp"
+#include "strata/core/native_miss_pickup.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 #include <cuda/atomic>
 #include <cuda_runtime.h>
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <mutex>
 #include <new>
@@ -29,6 +31,8 @@ struct NativeMissService::Impl {
     NativeMissPacket* packet = nullptr;
     float* norm = nullptr;
     float* results = nullptr;
+    NativeRouteLedger* ledger=nullptr;
+    size_t ledger_offset=0;
     std::vector<uint8_t> activation;
     std::array<kernels::cpu::ExpertJobMulti, 16> jobs{};
     std::atomic<bool> stopping{false};
@@ -36,20 +40,30 @@ struct NativeMissService::Impl {
     mutable std::mutex stats_mutex;
     NativeMissStats stats;
 
-    Impl(kernels::cpu::ExpertPool& p, std::vector<NativeMissSource> s, int width, int k, int tokens)
+    Impl(kernels::cpu::ExpertPool& p, std::vector<NativeMissSource> s, int width, int k, int tokens,bool record_routes)
         : pool(p), sources(std::move(s)), n_embd(width), ranks(k), max_tokens(tokens) {
         if (width < 1 || k < 1 || k > 16 || tokens < 1 || tokens > 2 || k * tokens > 16 || sources.empty())
             throw std::invalid_argument("invalid native miss service geometry");
+        if(record_routes && (sources.size()>64 || k!=8 || tokens!=1))
+            throw std::invalid_argument("invalid native route ledger geometry");
         size_t act_bytes = 0;
         for (const auto& source : sources) {
             if (!source.gate || !source.up || !source.down || source.n_expert < k ||
                 source.format.n_embd != width || !source.format.act_bytes)
                 throw std::invalid_argument("invalid native miss source view");
+            if(source.format.gu_type==40) {
+                if(source.format.d_type!=40 || !source.gate_scales || !source.up_scales || !source.down_scales)
+                    throw std::invalid_argument("NVFP4 miss source requires three immutable scale arrays");
+                for(int i=0;i<source.n_expert;++i)for(float s:{source.gate_scales[i],source.up_scales[i],source.down_scales[i]})
+                    if(!(s>0)||!std::isfinite(s))throw std::invalid_argument("invalid NVFP4 miss global scale");
+            }
             if (source.format.act_bytes > act_bytes) act_bytes = source.format.act_bytes;
         }
         activation_stride = act_bytes;
         activation.resize(act_bytes * size_t(max_tokens));
-        const size_t bytes = sizeof(NativeMissPacket) + size_t(width) * max_tokens * (k + 1) * sizeof(float);
+        ledger_offset=sizeof(NativeMissPacket)+size_t(width)*max_tokens*(k+1)*sizeof(float);
+        ledger_offset=(ledger_offset+63)&~size_t(63);
+        const size_t bytes=ledger_offset+(record_routes?sizeof(NativeRouteLedger):0);
         check(cudaHostAlloc(reinterpret_cast<void**>(&mapped), bytes, cudaHostAllocMapped));
         try { check(cudaHostGetDevicePointer(reinterpret_cast<void**>(&alias), mapped, 0)); }
         catch (...) { cudaFreeHost(mapped); mapped = nullptr; throw; }
@@ -57,20 +71,23 @@ struct NativeMissService::Impl {
         packet = new (mapped) NativeMissPacket{};
         norm = reinterpret_cast<float*>(mapped + sizeof(NativeMissPacket));
         results = norm + size_t(width) * max_tokens;
+        if(record_routes)ledger=new(mapped+ledger_offset)NativeRouteLedger{};
     }
     ~Impl() { stop(); if (mapped) cudaFreeHost(mapped); }
     void stop() {
         stopping.store(true, std::memory_order_release);
         if (worker.joinable()) worker.join();
     }
-    void serve(uint32_t epoch) {
+    void serve(uint32_t epoch,bool pickup_spin) {
+        native_miss_pickup::IdleWait<> idle(pickup_spin);
         const auto cores = kernels::cpu::physical_cores(false);
         const auto affinity = kernels::cpu::pin_current_thread(cores.empty() ? -1 : cores[0]);
         Atomic request(packet->request_seq), ack(packet->ack_seq), active(packet->active_epoch);
         uint32_t seen = 0;
         while (!stopping.load(std::memory_order_acquire)) {
             const uint32_t seq = request.load(cuda::memory_order_acquire);
-            if (!seq || seq == seen) { std::this_thread::yield(); continue; }
+            if (!seq || seq == seen) { idle.idle(); continue; }
+            idle.observed();
             seen = seq;
             if (active.load(cuda::memory_order_acquire) != epoch) break;
             const uint32_t mask = packet->mask;
@@ -101,6 +118,9 @@ struct NativeMissService::Impl {
                         job = {}; job.gate = gate;
                         job.up = source.up + size_t(id) * fmt.up_off;
                         job.down = source.down + size_t(id) * (fmt.bytes - fmt.down_off);
+                        job.gate_scale=source.gate_scales?source.gate_scales[id]:1.0f;
+                        job.up_scale=source.up_scales?source.up_scales[id]:1.0f;
+                        job.down_scale=source.down_scales?source.down_scales[id]:1.0f;
                     }
                     auto& job = jobs[size_t(index)];
                     if (job.nt >= tokens) throw std::runtime_error("duplicate miss in one row");
@@ -142,19 +162,21 @@ struct NativeMissService::Impl {
 };
 
 NativeMissService::NativeMissService(kernels::cpu::ExpertPool& pool,
-    std::vector<NativeMissSource> sources, int n_embd, int ranks, int max_tokens)
-    : impl_(std::make_unique<Impl>(pool, std::move(sources), n_embd, ranks, max_tokens)) {}
+    std::vector<NativeMissSource> sources, int n_embd, int ranks, int max_tokens,bool route_ledger)
+    : impl_(std::make_unique<Impl>(pool, std::move(sources), n_embd, ranks, max_tokens,route_ledger)) {}
 NativeMissService::~NativeMissService() = default;
 void NativeMissService::stop() { impl_->stop(); }
 void NativeMissService::start(uint32_t epoch) {
     if (!epoch) throw std::invalid_argument("miss epoch must be nonzero");
+    const bool pickup_spin=native_miss_pickup::enabled(); // Parent thread: invalid flags never escape a worker.
     impl_->stop();
+    if(impl_->ledger)*impl_->ledger=NativeRouteLedger{};
     Atomic(impl_->packet->active_epoch).store(epoch, cuda::memory_order_release);
     Atomic(impl_->packet->request_seq).store(0, cuda::memory_order_release);
     Atomic(impl_->packet->ack_seq).store(0, cuda::memory_order_release);
     { std::lock_guard<std::mutex> lock(impl_->stats_mutex); impl_->stats = {}; }
     impl_->stopping.store(false, std::memory_order_release);
-    impl_->worker = std::thread([this, epoch] { impl_->serve(epoch); });
+    impl_->worker = std::thread([this, epoch, pickup_spin] { impl_->serve(epoch,pickup_spin); });
 }
 NativeMissArgs NativeMissService::device_args() const {
     NativeMissArgs args;
@@ -162,11 +184,13 @@ NativeMissArgs NativeMissService::device_args() const {
     args.norm_host_alias = reinterpret_cast<float*>(impl_->alias + sizeof(NativeMissPacket));
     args.result_host_alias = args.norm_host_alias + size_t(impl_->n_embd) * impl_->max_tokens;
     args.n_embd = impl_->n_embd; args.ranks = impl_->ranks;
+    if(impl_->ledger)args.ledger=reinterpret_cast<NativeRouteLedger*>(impl_->alias+impl_->ledger_offset);
     return args;
 }
 NativeMissStats NativeMissService::snapshot() const {
     std::lock_guard<std::mutex> lock(impl_->stats_mutex);
     return impl_->stats;
 }
+const NativeRouteLedger* NativeMissService::route_ledger() const { return impl_->ledger; }
 
 } // namespace strata::core

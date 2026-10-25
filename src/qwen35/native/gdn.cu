@@ -72,13 +72,16 @@ void gdn_recurrence(GdnInputs input, GdnShape shape, float *output, float *state
 void gdn_recurrence_prefix(GdnInputs input, GdnShape shape, float *output, float *state,
                            GdnPrefix prefix, cudaStream_t stream) {
     if (!input.q || !input.k || !input.v || !input.log_decay || !input.beta || !input.state ||
-        !output || !state || !prefix.state[0] || (shape.tokens == 3 && !prefix.state[1]) ||
-        shape.key_dim != 128 || shape.value_dim != 128 || shape.query_heads < 1 ||
+        !output || !state || shape.key_dim != 128 || shape.value_dim != 128 || shape.query_heads < 1 ||
         shape.value_heads < 1 || shape.value_heads > 256 || shape.value_heads % shape.query_heads ||
-        (shape.tokens != 2 && shape.tokens != 3) || prefix.state[0] == input.state ||
-        prefix.state[0] == state || (shape.tokens == 3 && (prefix.state[1] == input.state ||
-        prefix.state[1] == state || prefix.state[1] == prefix.state[0])))
-        throw std::invalid_argument("invalid retained GDN prefix lease");
+        shape.tokens < 2 || shape.tokens > 4)
+        throw std::invalid_argument("invalid retained GDN prefix geometry");
+    for(int slot=0;slot<shape.tokens-1;++slot){
+        const auto *p=prefix.state[slot];
+        if(!p||p==input.state||p==state)throw std::invalid_argument("invalid retained GDN state lease");
+        for(int earlier=0;earlier<slot;++earlier)if(p==prefix.state[earlier])
+            throw std::invalid_argument("aliased retained GDN states");
+    }
     const dim3 grid(shape.value_dim / 8, shape.value_heads);
     recurrence<128, true><<<grid, 128, 0, stream>>>(input, shape, output, state,
                                                   1.0f / std::sqrt(float(shape.key_dim)), prefix);

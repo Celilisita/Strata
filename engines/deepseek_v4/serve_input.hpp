@@ -2,10 +2,12 @@
 #include <atomic>
 #include <cerrno>
 #include <condition_variable>
+#include <cstring>
 #include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <stdexcept>
 #include <thread>
 #include <utility>
 #ifdef _WIN32
@@ -22,25 +24,26 @@ class ServeInput {
     struct State {
         std::mutex mutex;std::condition_variable ready;
         std::deque<std::pair<std::string,Flag>> lines;
-        Flag active;bool eof=false;
+        Flag active;bool eof=false;std::string error;
     };
     std::shared_ptr<State> state_=std::make_shared<State>();
 public:
-    ServeInput(){
+    explicit ServeInput(int descriptor=0){
         const auto state=state_;
-        std::thread([state]{
-            std::string buffer;char chunk[4096];
+        std::thread([state,descriptor]{
+            std::string buffer,failure;char chunk[4096];
             auto line=[&](std::string& value){
                 for(;;){
                     const auto end=buffer.find('\n');
                     if(end!=std::string::npos){value.assign(buffer,0,end);buffer.erase(0,end+1);return true;}
 #ifdef _WIN32
-                    const int n=_read(0,chunk,unsigned(sizeof(chunk)));
+                    const int n=_read(descriptor,chunk,unsigned(sizeof(chunk)));
 #else
-                    const auto n=::read(0,chunk,sizeof(chunk));
-                    if(n<0&&errno==EINTR)continue;
+                    const auto n=::read(descriptor,chunk,sizeof(chunk));
 #endif
-                    if(n<=0){if(buffer.empty())return false;value.swap(buffer);buffer.clear();return true;}
+                    if(n<0&&errno==EINTR)continue;
+                    if(n<0){failure="serve input read failed: "+std::string(std::strerror(errno));return false;}
+                    if(n==0){if(buffer.empty())return false;value.swap(buffer);buffer.clear();return true;}
                     buffer.append(chunk,size_t(n));
                 }
             };
@@ -59,12 +62,15 @@ public:
                 state->ready.notify_one();
                 if(quit)break;
             }
-            std::lock_guard<std::mutex> lock(state->mutex);state->eof=true;state->ready.notify_one();
+            std::lock_guard<std::mutex> lock(state->mutex);state->eof=true;state->error=std::move(failure);
+            if(!state->error.empty()&&state->active)state->active->store(true);
+            state->ready.notify_one();
         }).detach();
     }
     bool next(std::string& line,Flag& cancel){
         std::unique_lock<std::mutex> lock(state_->mutex);
         state_->ready.wait(lock,[&]{return state_->eof||!state_->lines.empty();});
+        if(!state_->error.empty())throw std::runtime_error(state_->error);
         if(state_->lines.empty())return false;
         auto command=std::move(state_->lines.front());state_->lines.pop_front();
         line=std::move(command.first);cancel=std::move(command.second);state_->active=cancel;return true;

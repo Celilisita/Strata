@@ -1,5 +1,6 @@
 #include "strata/qwen35moe/runtime.hpp"
 #include "strata/qwen35moe/cpu_state.hpp"
+#include "strata/qwen35moe/nvfp4_expert_state.hpp"
 #include "strata/qwen35moe/cuda_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 
@@ -30,7 +31,7 @@ void Runtime::batch_moe_cpu_ready(size_t il, const LayerWeights& layer, int coun
 
     std::string error;
     kernels::cpu::NativeFmt fmt;
-    if (!kernels::cpu::native_fmt(12, int(source.down_exps->type), 2048, 512, fmt, error))
+    if (!kernels::cpu::native_fmt(int(source.gate_exps->type), int(source.down_exps->type), 2048, 512, fmt, error))
         throw std::runtime_error(error);
     c.activations.resize(size_t(count) * fmt.act_bytes);
     c.parts.resize(size_t(count) * 8 * 2048);
@@ -73,6 +74,8 @@ void Runtime::batch_moe_cpu_ready(size_t il, const LayerWeights& layer, int coun
             job.gate = gate + size_t(id) * fmt.up_off;
             job.up = up + size_t(id) * fmt.up_off;
             job.down = down + size_t(id) * down_bytes;
+            if(nvfp4_){const auto scales=nvfp4_->inventory.view(il,id);
+                job.gate_scale=scales.gate_scale;job.up_scale=scales.up_scale;job.down_scale=scales.down_scale;}
             job.nt = 1;
             job.nact[0] = act;
             job.out[0] = c.parts.data() + (size_t(t) * 8 + rank) * 2048;

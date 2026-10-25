@@ -2,9 +2,9 @@
 #include "strata/qwen35/native/gdn.hpp"
 
 namespace strata::qwen35::native {
-// Stable, caller-owned slots after the first and second verified inputs.
+// Stable, caller-owned slots after the first three verified inputs.
 // The last token remains in the ordinary authoritative state/history.
-struct GdnPrefix { float *state[2]{}, *history[2]{}; };
+struct GdnPrefix { float *state[3]{}, *history[3]{}; };
 void gdn_recurrence_prefix(GdnInputs, GdnShape, float *output, float *final_state,
                            GdnPrefix, cudaStream_t);
 void conv_prefix_history(const float *input, const float *history, GdnPrefix,

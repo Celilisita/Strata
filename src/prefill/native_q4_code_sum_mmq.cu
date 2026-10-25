@@ -1,6 +1,8 @@
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/prefill/native_grouped_mmq.hpp"
+#include "strata/prefill/native_code_sum_support.hpp"
 #include "common.cuh"
+#include "strata/prefill/native_q6_accum_mmq.hpp"
 #include <cstdint>
 #include <stdexcept>
 // Separate backend instantiations prevent ODR collisions with ordinary DS4 MMQ.
@@ -26,8 +28,39 @@
 
 namespace strata::prefill::mmq {
 namespace {
+bool code_sum_device(int& cc, size_t& shared) {
+    const auto& dev = ggml_cuda_info().devices[ggml_cuda_get_device()];
+    cc = dev.cc; shared = dev.smpbo; // Actual CUDA opt-in limit, not an assumed GPU name.
+    const int arch = ggml_cuda_highest_compiled_arch(cc);
+    if (cc == 1200 && arch == 1200) return true;
+    return shared && (arch == GGML_CUDA_CC_VOLTA ||
+        (cc == GGML_CUDA_CC_TURING && arch == GGML_CUDA_CC_TURING));
+}
+bool code_sum_config(const strata_code_sum_mmq_config& c, int type, int cc, size_t shared) {
+    return c.type == type && !c.use_mma_data_layout(cc) &&
+        c.I == native_code_sum_tile_rows && c.nthreads == native_code_sum_threads &&
+        c.occupancy == 1 && c.K_vram == native_code_sum_k &&
+        mmq_get_nbytes_shared(c, cc) <= shared;
+}
+__device__ constexpr bool code_sum_device_config() {
+#if __CUDA_ARCH__ == 700 || __CUDA_ARCH__ == 750
+    for (int type = GGML_TYPE_Q4_K; type <= GGML_TYPE_Q6_K; type += 2) {
+        for (int fallback = 0; fallback < 2; ++fallback) {
+            for (int j = 8; j <= 128; j += 8) {
+                const auto c = ggml_cuda_mmq_get_config(ggml_type(type), j, bool(fallback) STRATA_NATIVE_MMQ_Q8);
+                if (c.type == GGML_TYPE_COUNT) continue;
+                if (c.use_mma_data_layout() || c.I != native_code_sum_tile_rows ||
+                    c.nthreads != native_code_sum_threads || c.occupancy != 1 ||
+                    c.K_vram != native_code_sum_k) return false;
+            }
+        }
+    }
+#endif
+    return true;
+}
 template<bool D4>
 __global__ void pack_code_sum(const block_q8_1* input, block_q8_1_mmq* output, int cols, int rows, const int32_t* ids = nullptr, int source_rows = 0) {
+    static_assert(code_sum_device_config(), "private code-sum host/device DP4A contract");
     const int cell = blockIdx.x * blockDim.x + threadIdx.x;
     if (cell >= rows * (cols / QK8_1_MMQ)) return;
     const int token = cell % rows, kb = cell / rows;
@@ -52,6 +85,31 @@ __global__ void pack_code_sum(const block_q8_1* input, block_q8_1_mmq* output, i
         for (int k = 0; k < 8; ++k) packed[k] = codes[k];
     }
 }
+}
+bool native_code_sum_dense_supported(int cols, int outputs, int tokens) {
+    if (cols < 512 || cols % 512 || outputs < 1 || tokens < 1 || tokens > 8192) return false;
+    int cc = 0; size_t shared = 0;
+    if (!code_sum_device(cc, shared)) return false;
+    if (cc == 1200) return true;
+    const bool fallback = ggml_cuda_mmq_needs_fallback(outputs);
+    bool legal = false;
+    for (int j = 8; j <= 128; j += 8) {
+        const auto c = ggml_cuda_mmq_get_config(GGML_TYPE_Q4_K, j, fallback, cc STRATA_NATIVE_MMQ_Q8);
+        if (c.type == GGML_TYPE_COUNT || mmq_get_nbytes_shared(c, cc) > shared) continue;
+        if (!code_sum_config(c, GGML_TYPE_Q4_K, cc, shared)) return false;
+        legal = true;
+    }
+    return legal;
+}
+bool native_code_sum_grouped_supported(int type, int cols, int outputs) {
+    if ((type != GGML_TYPE_Q4_K && type != GGML_TYPE_Q6_K) ||
+        cols < 512 || cols % 512 || outputs < 128 || outputs % native_code_sum_tile_rows) return false;
+    int cc = 0; size_t shared = 0;
+    if (!code_sum_device(cc, shared)) return false;
+    if (cc == 1200) return true;
+    const auto c = ggml_cuda_mmq_get_config(ggml_type(type), native_code_sum_group_columns,
+        false, cc STRATA_NATIVE_MMQ_Q8);
+    return code_sum_config(c, type, cc, shared);
 }
 void repack_native_q8_code_sum(const void* input, void* output, int cols, int rows, void* stream) {
     if (!input || !output || !stream || cols < 512 || cols % 512 || rows < 1 || rows > 8192)
@@ -84,8 +142,10 @@ void Context::run_code_sum(const Product& p, void* stream) {
         p.total_rows > 8192 || p.max_rows != p.total_rows || p.ld_dst != p.w_rows || p.ids || p.bounds)
         throw std::invalid_argument("unsupported exact-code-sum MMQ product");
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    if (ggml_cuda_highest_compiled_arch(cc) != GGML_CUDA_CC_VOLTA)
-        throw std::runtime_error("exact-code-sum MMQ currently requires the measured Volta DP4A provider");
+    const int compiled = ggml_cuda_highest_compiled_arch(cc);
+    if (compiled == 1200) { run_q4_canonical(p,stream); return; }
+    if (!native_code_sum_dense_supported(int(p.w_cols), int(p.w_rows), int(p.total_rows)))
+        throw std::runtime_error("unsupported private DP4A code-sum MMQ device/shape");
     mmq_args a{};
     a.x = static_cast<const char*>(p.w); a.type_x = GGML_TYPE_Q4_K;
     a.y = static_cast<const int*>(p.xq); a.dst = p.dst;

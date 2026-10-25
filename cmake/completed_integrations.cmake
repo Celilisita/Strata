@@ -1,0 +1,17 @@
+# Completed source integrations; no diagnostics or automatic application execution.
+include_guard(GLOBAL)
+include("${CMAKE_CURRENT_LIST_DIR}/completed_moe.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/completed_gemma.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/completed_sm70_provider.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/completed_v100_kernels.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/completed_original_provider.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/completed_v100_qwen.cmake")
+option(STRATA_SMALL_DENSE "Register completed MiniCPM5/Qwen small dense families" OFF)
+if(STRATA_SMALL_DENSE)
+  include("${CMAKE_CURRENT_LIST_DIR}/dense.cmake")
+endif()
+if(TARGET strata-vision)
+  target_compile_definitions(strata-vision PRIVATE STRATA_GLM5_NEXT_SPLITS=1)
+endif()
+# Include after every family has registered its normal targets.
+include("${CMAKE_CURRENT_LIST_DIR}/production_targets.cmake")

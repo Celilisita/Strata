@@ -1,5 +1,6 @@
 #include "strata/qwen35moe/runtime.hpp"
 #include <stdexcept>
+#include <cstdio>
 
 namespace strata::qwen35moe {
 // Diagnostic-only CUDA intervals. All events are created before submission and
@@ -24,6 +25,48 @@ void Runtime::collect_prefill_events(int chunks, Metrics& metrics) {
     for (size_t i = 0; i < size_t(chunks) * layers_.size(); ++i)
         dense_profile_.collect(i, spec_.layers[i % layers_.size()].recurrent ?
             metrics.pp_gdn_detail : metrics.pp_attention_detail);
+    if (metrics.pp_gdn_detail.layers || metrics.pp_attention_detail.layers) {
+        const auto& gdn = metrics.pp_gdn_detail;
+        const auto& attention = metrics.pp_attention_detail;
+        std::fprintf(stderr,
+            "qwen35_pp_dense_detail chunks=%d batch_capacity=%d gdn_layers=%llu attention_layers=%llu event_objects=%llu "
+            "gdn_input_ms=%.9g gdn_query_ms=%.9g gdn_key_ms=%.9g "
+            "gdn_value_ms=%.9g gdn_preprocess_ms=%.9g gdn_short_attention_ms=%.9g "
+            "gdn_core_ms=%.9g gdn_post_ms=%.9g gdn_output_quant_ms=%.9g "
+            "gdn_output_projection_ms=%.9g gdn_residual_ms=%.9g "
+            "attention_input_ms=%.9g attention_query_ms=%.9g attention_key_ms=%.9g "
+            "attention_value_ms=%.9g attention_preprocess_ms=%.9g attention_short_attention_ms=%.9g "
+            "attention_core_ms=%.9g attention_post_ms=%.9g attention_output_quant_ms=%.9g "
+            "attention_output_projection_ms=%.9g attention_residual_ms=%.9g "
+            "gdn_preprocess_submit_ms=%.9g gdn_core_submit_ms=%.9g\n",
+            chunks, batch_.capacity, static_cast<unsigned long long>(gdn.layers),
+            static_cast<unsigned long long>(attention.layers),
+            static_cast<unsigned long long>(metrics.pp_dense_diagnostic_events),
+            gdn.gpu_ms[size_t(DenseStage::Input)],
+            gdn.gpu_ms[size_t(DenseStage::Query)],
+            gdn.gpu_ms[size_t(DenseStage::Key)],
+            gdn.gpu_ms[size_t(DenseStage::Value)],
+            gdn.gpu_ms[size_t(DenseStage::Preprocess)],
+            gdn.gpu_ms[size_t(DenseStage::ShortAttention)],
+            gdn.gpu_ms[size_t(DenseStage::Core)],
+            gdn.gpu_ms[size_t(DenseStage::Post)],
+            gdn.gpu_ms[size_t(DenseStage::OutputQuant)],
+            gdn.gpu_ms[size_t(DenseStage::OutputProjection)],
+            gdn.gpu_ms[size_t(DenseStage::Residual)],
+            attention.gpu_ms[size_t(DenseStage::Input)],
+            attention.gpu_ms[size_t(DenseStage::Query)],
+            attention.gpu_ms[size_t(DenseStage::Key)],
+            attention.gpu_ms[size_t(DenseStage::Value)],
+            attention.gpu_ms[size_t(DenseStage::Preprocess)],
+            attention.gpu_ms[size_t(DenseStage::ShortAttention)],
+            attention.gpu_ms[size_t(DenseStage::Core)],
+            attention.gpu_ms[size_t(DenseStage::Post)],
+            attention.gpu_ms[size_t(DenseStage::OutputQuant)],
+            attention.gpu_ms[size_t(DenseStage::OutputProjection)],
+            attention.gpu_ms[size_t(DenseStage::Residual)],
+            gdn.submit_ms[size_t(DenseStage::Preprocess)],
+            gdn.submit_ms[size_t(DenseStage::Core)]);
+    }
     if (prefill_events_.empty()) return;
     const size_t count = size_t(chunks) * layers_.size();
     for (size_t i = 0; i < count; ++i) {
@@ -45,6 +88,23 @@ void Runtime::collect_prefill_events(int chunks, Metrics& metrics) {
         metrics.pp_down_event_ms += ms;
         cuda_check(cudaEventElapsedTime(&ms, group[6], group[4]), "prefill shared event");
         metrics.pp_shared_event_ms += ms;
+    }
+    if (metrics.pp_gu_plan_calls || metrics.pp_gu_plan_invalid) {
+        std::fprintf(stderr,
+            "qwen35_pp_gu_plan chunks=%d batch_capacity=%d calls=%llu active_calls=%llu "
+            "groups=%llu max_rows=%llu active_tiles=%llu rectangular_tiles=%llu scheduled_tiles=%llu "
+            "entries=%llu tile_control_bytes=%llu invalid=%llu tile_J=64 cta_multiplier=8\n",
+            chunks, batch_.capacity,
+            static_cast<unsigned long long>(metrics.pp_gu_plan_calls),
+            static_cast<unsigned long long>(metrics.pp_gu_plan_active_calls),
+            static_cast<unsigned long long>(metrics.pp_gu_plan_groups),
+            static_cast<unsigned long long>(metrics.pp_gu_plan_max_rows),
+            static_cast<unsigned long long>(metrics.pp_gu_plan_active_tiles),
+            static_cast<unsigned long long>(metrics.pp_gu_plan_rectangular_tiles),
+            static_cast<unsigned long long>(metrics.pp_gu_plan_scheduled_tiles),
+            static_cast<unsigned long long>(metrics.pp_gu_plan_entries),
+            static_cast<unsigned long long>(metrics.pp_gu_plan_tile_control_bytes),
+            static_cast<unsigned long long>(metrics.pp_gu_plan_invalid));
     }
 }
 } // namespace strata::qwen35moe

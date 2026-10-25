@@ -2,9 +2,12 @@
 #include "options.hpp"
 #include "device_cache.hpp"
 #include "serve_input.hpp"
-#include "serve_sampling.hpp"
+#include "serve_request.hpp"
+#include "serve_finish.hpp"
 #include "runtime_memory.hpp"
 #include "serve_metrics.hpp"
+#include "../glm5_next/kernel_activity.hpp"
+#include "../glm5_next/serve_mtp.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -33,32 +36,7 @@ double milliseconds(Clock::time_point start) {
     return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
 }
 
-bool parse_ids(const std::string& value, std::vector<llama_token>& ids, bool image) {
-    ids.clear();
-    std::istringstream stream(value);
-    std::string item;
-    while (std::getline(stream, item, ',')) {
-        if (item.empty()) return false;
-        char* end = nullptr;
-        const long token = std::strtol(item.c_str(), &end, 10);
-        if (!end || *end || token < (image ? -1 : 0) ||
-            token > std::numeric_limits<llama_token>::max()) return false;
-        ids.push_back(static_cast<llama_token>(token));
-    }
-    return !ids.empty();
-}
-
-struct Request : strata::deepseek_v4::ServeSampling {
-    int limit=0;
-    std::string embeddings_path;
-    std::vector<llama_token> ids;
-};
-
-bool parse_number(const std::string& value, double& result) {
-    char* end = nullptr;
-    result = std::strtod(value.c_str(), &end);
-    return end != value.c_str() && *end == '\0' && std::isfinite(result);
-}
+using Request = strata::deepseek_v4::ServeRequest;
 
 llama_token sample_logits(Runtime& runtime,const Request& request,std::mt19937_64& rng,
                           const strata::deepseek_v4::ServeHistory& history){
@@ -66,89 +44,6 @@ llama_token sample_logits(Runtime& runtime,const Request& request,std::mt19937_6
         llama_vocab_n_tokens(runtime.vocab()),request,history,rng,[&](llama_token id){return runtime.is_eog(id);});
     strata::deepseek_v4::idle_device_expert_cache(runtime.context());
     return token;
-}
-
-bool parse_request(const std::string& line, Request& out, std::string& error) {
-    const bool image = line.rfind("GENI ", 0) == 0;
-    if (!image && line.rfind("GEN ", 0) != 0) {
-        error = "expected GEN <max_new> <ids> or GENI <max_new> <file> <ids>";
-        return false;
-    }
-    std::istringstream stream(line.substr(image ? 5 : 4));
-    if (!(stream >> out.limit) || out.limit < 1) {
-        error = "bad generation limit";
-        return false;
-    }
-    std::string word;
-    std::string id_text;
-    while (stream >> word) {
-        const auto equals = word.find('=');
-        if (equals == std::string::npos) {
-            if (image) {
-                out.embeddings_path = word;
-                stream >> id_text;
-            } else {
-                id_text = word;
-            }
-            break;
-        }
-        if (word.substr(0, equals) == "ignore_eog") {
-            const auto value = word.substr(equals + 1);
-            if (value != "0" && value != "1") {
-                error = "ignore_eog must be 0 or 1";
-                return false;
-            }
-            out.ignore_eog = value == "1";
-        } else {
-            const std::string key = word.substr(0, equals);
-            const std::string value = word.substr(equals + 1);
-            double number = 0.0;
-            if (key == "temperature" || key == "top_p" || key == "min_p") {
-                if (!parse_number(value, number) ||
-                    (key == "temperature" && number < 0.0) ||
-                    (key == "top_p" && (number <= 0.0 || number > 1.0)) ||
-                    (key == "min_p" && (number < 0.0 || number > 1.0))) {
-                    error = "invalid sampling value for " + key;
-                    return false;
-                }
-                if (key == "temperature") out.temperature = number;
-                else if (key == "top_p") out.top_p = number;
-                else out.min_p = number;
-            } else if (key == "top_k") {
-                char* end = nullptr;
-                const long parsed = std::strtol(value.c_str(), &end, 10);
-                if (end == value.c_str() || *end || parsed < 1 || parsed > 64) {
-                    error = "top_k must be in 1..64";
-                    return false;
-                }
-                out.top_k = int(parsed);
-            } else if(key=="penalty_repeat"||key=="penalty_freq"||key=="penalty_present"){
-                if(!parse_number(value,number)||(key=="penalty_repeat"&&number<=0)){
-                    error="invalid penalty value for "+key;return false;
-                }
-                if(key=="penalty_repeat")out.penalty_repeat=number;
-                else if(key=="penalty_freq")out.penalty_freq=number;
-                else out.penalty_present=number;
-            } else if(key=="penalty_last_n"){
-                char* end=nullptr;const long window=std::strtol(value.c_str(),&end,10);
-                if(end==value.c_str()||*end||window<0||window>262144){error="invalid penalty history window";return false;}
-                out.penalty_last_n=int(window);
-            } else if (key == "seed") {
-                char* end = nullptr;
-                const unsigned long long parsed = std::strtoull(value.c_str(), &end, 10);
-                if (end == value.c_str() || *end || value[0] == '-') {
-                    error = "invalid sampling seed";
-                    return false;
-                }
-                out.seed = uint64_t(parsed);
-            }
-        }
-    }
-    if ((image && out.embeddings_path.empty()) || !parse_ids(id_text, out.ids, image)) {
-        error = "bad prompt IDs";
-        return false;
-    }
-    return true;
 }
 
 bool evaluate_image_prompt(Runtime& runtime, const Request& request, std::string& error,const std::atomic<bool>* cancel) {
@@ -159,6 +54,7 @@ bool evaluate_image_prompt(Runtime& runtime, const Request& request, std::string
     if (width <= 0) { error = "model has no image input width"; return false; }
     size_t at = 0;
     size_t image_count = 0;
+    const bool glm = runtime.metadata("general.architecture") == "glm5-next";
     while (at < ids.size()) {
         if(cancel&&cancel->load()){error="request cancelled";return false;}
         size_t end = at + 1;
@@ -176,7 +72,7 @@ bool evaluate_image_prompt(Runtime& runtime, const Request& request, std::string
                     header[0] != 0x31455653 || header[1] <= 0 ||
                     size_t(header[1]) > remaining || header[2] != header[1] ||
                     header[3] != 1 || header[4] != width ||
-                    size_t(header[1]) > runtime.options().n_ubatch) {
+                    (!glm && size_t(header[1]) > runtime.options().n_ubatch)) {
                     error = "image embedding record does not match prompt";
                     return false;
                 }
@@ -187,8 +83,12 @@ bool evaluate_image_prompt(Runtime& runtime, const Request& request, std::string
                     error = "short image embedding record";
                     return false;
                 }
-                if (!runtime.decode_image(rows.data(), rows_count, runtime.position(),
-                                          end == ids.size() && rows_count == remaining, error)) return false;
+                for(size_t offset=0;offset<rows_count;) {
+                    const size_t n=std::min<size_t>(runtime.options().n_ubatch, rows_count-offset);
+                    if (!runtime.decode_image(rows.data()+offset*size_t(width), n, runtime.position(),
+                        end==ids.size() && rows_count==remaining && offset+n==rows_count,error))return false;
+                    offset+=n;
+                }
                 remaining -= rows_count;
                 ++image_count;
             }
@@ -216,24 +116,45 @@ int generate(Runtime& runtime, const Request& request,const std::shared_ptr<std:
         return 0;
     }
     std::string error;
+    for(auto id:request.ids)if(id>=llama_vocab_n_tokens(runtime.vocab())) {
+        std::puts("ERR prompt token ID lies outside the model vocabulary");return 0;
+    }
+    bool request_mtp=false;
+    if(!strata::deepseek_v4::resolve_serve_mtp(request,runtime.glm_mtp_enabled()||runtime.mtp_enabled(),request_mtp,error,
+                                            runtime.glm_mtp_enabled())) {
+        std::printf("ERR %s\n",error.c_str());return 0;
+    }
     llama_synchronize(runtime.context());
+    strata::deepseek_v4::settle_device_background(runtime.context());
     runtime.reset(true);
+    const bool glm_mtp=runtime.glm_mtp_enabled()&&request_mtp;
+    runtime.glm_mtp_request(glm_mtp);
+    std::fprintf(stderr,"strata_serve_request effective_mtp=%d mtp_requested=%d temperature=%.17g top_k=%d top_p=%.17g min_p=%.17g seed_given=%d seed=%llu penalty_repeat=%.17g penalty_freq=%.17g penalty_present=%.17g penalty_last_n=%d max_new=%d image=%d ignore_eog=%d\n",
+        int(request_mtp&&(runtime.glm_mtp_enabled()||request.ids.size()>=2)),request.mtp,
+        request.temperature,request.top_k,request.top_p,request.min_p,int(request.seed_given),
+        (unsigned long long)request.seed,request.penalty_repeat,request.penalty_freq,
+        request.penalty_present,request.penalty_last_n,request.limit,int(!request.embeddings_path.empty()),int(request.ignore_eog));
+    std::fflush(stderr);
     const strata::deepseek_v4::ServeMetrics counters(runtime);
+    strata::glm5_next::KernelActivity kernel_activity(strata::glm5_next::kernel_activity_requested());
     const auto start = Clock::now();
     const bool evaluated = request.embeddings_path.empty()
         ? runtime.evaluate(request.ids, error,cancel.get())
         : evaluate_image_prompt(runtime, request, error,cancel.get());
     if(!evaluated&&cancel->load()){
         llama_synchronize(runtime.context());
-        std::printf("DONE 0 %zu %.3f 0 cancel 0 0 0\n",request.ids.size(),milliseconds(start));return 0;
+        strata::deepseek_v4::settle_device_background(runtime.context());
+        const double pp_ms=milliseconds(start);
+        strata::deepseek_v4::report_serve_finish("cancel",0,request.ids.size(),size_t(runtime.position()),pp_ms,0);
+        std::printf("DONE 0 %zu %.3f 0 cancel 0 0 0\n",request.ids.size(),pp_ms);return 0;
     }
-    if (!evaluated) {
-        std::printf("ERR %s\n", error.c_str());
-        return 0;
-    }
+    if (!evaluated) throw std::runtime_error(error);
     // Complete the request boundary before reporting PP, as the first sample requires.
     llama_synchronize(runtime.context());
+    if(glm_mtp)
+        return strata::glm5_next::serve_mtp(runtime,request,cancel,start,counters,kernel_activity);
     const double pp_ms = milliseconds(start);
+    const auto pp_activity=kernel_activity.snapshot();
     strata::deepseek_v4::runtime_memory("after-prefill");
     std::printf("PP %zu %zu %.3f %.3f\n", request.ids.size(), request.ids.size(),
                 pp_ms, request.ids.size() * 1000.0 / std::max(0.001, pp_ms));
@@ -251,8 +172,8 @@ int generate(Runtime& runtime, const Request& request,const std::shared_ptr<std:
         stopped = !request.ignore_eog && runtime.is_eog(token);
     };
     // Greedy MTP verification cannot preserve a stochastic target distribution.
-    const bool use_mtp = request.temperature == 0.0 && !request.penalties() && runtime.mtp_enabled() && request.embeddings_path.empty();
-    std::mt19937_64 rng(request.seed ? request.seed : std::random_device{}());
+    const bool use_mtp = request_mtp && runtime.mtp_enabled();
+    auto rng = strata::deepseek_v4::serve_rng(request);
     auto choose = [&]() { return (request.temperature > 0.0 || request.penalties()) ? sample_logits(runtime, request, rng,history)
                                                        : runtime.greedy(request.ignore_eog); };
     if (use_mtp && request.limit > 1 && request.ids.size() >= 2) runtime.mtp_begin(request.ids);
@@ -261,8 +182,7 @@ int generate(Runtime& runtime, const Request& request,const std::shared_ptr<std:
     while (!stopped && emitted < request.limit && !cancel->load()) {
         if (!use_mtp || request.ids.size() < 2 || request.limit - emitted == 1) {
             if (runtime.decode_tokens(&pending, 1, runtime.position(), true, error)) {
-                std::printf("ERR %s\n", error.c_str());
-                return 0;
+                throw std::runtime_error(error);
             }
             if(cancel->load())break;
             pending = choose();
@@ -274,8 +194,7 @@ int generate(Runtime& runtime, const Request& request,const std::shared_ptr<std:
         ++offered;
         const llama_token verify[] = {pending, draft};
         if (runtime.decode_tokens(verify, 2, position, false, error, true)) {
-            std::printf("ERR %s\n", error.c_str());
-            return 0;
+            throw std::runtime_error(error);
         }
         const llama_token target = runtime.greedy_at(0);
         if (draft != target) {
@@ -292,10 +211,21 @@ int generate(Runtime& runtime, const Request& request,const std::shared_ptr<std:
         pending = bonus;
         send(bonus);
     }
-    if(cancel->load())llama_synchronize(runtime.context());
+    const char* finish=strata::deepseek_v4::serve_finish_reason(stopped,size_t(emitted),size_t(request.limit));
+    llama_synchronize(runtime.context());
+    strata::deepseek_v4::settle_device_background(runtime.context());
     const auto tg_ms=milliseconds(tg_start);counters.report(runtime);
+    if(kernel_activity.active()){
+        const auto counts=kernel_activity.finish();
+        std::fprintf(stderr,"strata_kernel_activity pp_kernels=%llu tg_kernels=%llu dropped=%llu errors=%llu profiled=1\n",
+            (unsigned long long)pp_activity.kernels,(unsigned long long)(counts.kernels-pp_activity.kernels),
+            (unsigned long long)counts.dropped,(unsigned long long)counts.errors);
+        std::fflush(stderr);
+        if(counts.dropped||counts.errors||!counts.kernels)throw std::runtime_error("kernel activity incomplete");
+    }
+    strata::deepseek_v4::report_serve_finish(finish,size_t(emitted),request.ids.size(),request.ids.size(),pp_ms,tg_ms);
     std::printf("DONE %d %zu %.3f %.3f %s %d %d 0\n", emitted, request.ids.size(), pp_ms,
-                tg_ms, cancel->load() ? "cancel" : stopped ? "stop" : "limit", accepted, offered);
+                tg_ms, finish, accepted, offered);
     return 0;
 }
 }  // namespace
@@ -315,7 +245,7 @@ int strata_deepseek_v4_serve(int argc, char** argv) {
         for (size_t i = 0; i < remaining.size(); ++i) {
             if (remaining[i] == "--serve") serve = true;
             else if (remaining[i] == "--vision") vision = true;
-            else if (remaining[i] == "--family" && i + 1 < remaining.size() && remaining[++i] == "deepseek_v4") {}
+            else if (remaining[i] == "--family" && i + 1 < remaining.size() && (remaining[++i] == "deepseek_v4" || remaining[i] == "glm5_next")) {}
             else if (remaining[i] == "--help") {
                 std::fputs(strata::deepseek_v4::options_usage(), stdout);
                 return 0;
@@ -341,7 +271,8 @@ int strata_deepseek_v4_serve(int argc, char** argv) {
             std::fprintf(stderr, "strata deepseek_v4: %s\n", error.c_str());
             return 1;
         }
-        std::printf("INFO family=deepseek_v4 mtp=%d\nREADY %u stop\n", runtime->mtp_enabled() ? 1 : 0,
+        std::printf("INFO family=%s mtp=%d\nREADY %u stop\n",
+                    runtime->metadata("general.architecture") == "glm5-next" ? "glm5_next" : "deepseek_v4", (runtime->mtp_enabled()||runtime->glm_mtp_enabled()) ? 1 : 0,
                     options.n_ctx);
         strata::deepseek_v4::ServeInput input;
         std::string line;std::shared_ptr<std::atomic<bool>> cancel;
@@ -357,7 +288,7 @@ int strata_deepseek_v4_serve(int argc, char** argv) {
                     continue;
                 }
                 Request request;
-                if (!parse_request(line, request, error)) {
+                if (!strata::deepseek_v4::parse_serve_request(line, request, error)) {
                     std::printf("ERR %s\n", error.c_str());
                     continue;
                 }
@@ -366,8 +297,19 @@ int strata_deepseek_v4_serve(int argc, char** argv) {
                     continue;
                 }
                 generate(*runtime, request,cancel);
+            } catch (const std::invalid_argument& failure) {
+                // A rejected sampling policy can reset cleanly without
+                // treating it as a model/provider execution failure.
+                llama_synchronize(runtime->context());
+                strata::deepseek_v4::settle_device_background(runtime->context());
+                runtime->reset(true);
+                std::printf("ERR %s\n",failure.what());
             } catch (const std::exception& failure) {
                 std::printf("ERR %s\n", failure.what());
+                // A GLM provider/state failure is terminal for this context.
+                // Drain and release it; the public frontend may reload on the
+                // next request rather than reusing a poisoned slot directory.
+                if(runtime->metadata("general.architecture")=="glm5-next")throw;
             }
         }
         return 0;

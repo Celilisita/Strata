@@ -13,6 +13,7 @@ from typing import Callable
 
 from serve.native_sampling import parameters as sampling_parameters
 from serve.native_slots import NativeSlots
+from serve.prefill_metrics import PrefillMeter
 
 
 class NativeFamilyRunner:
@@ -20,7 +21,8 @@ class NativeFamilyRunner:
                  gguf_python: Path, context: int, temp_dir: Path,
                  block_size: int = 15, slots: int = 1, dspark: bool = False, *,
                  family="qwen35_moe", variant="minicpm_v47", mtp=0,
-                 kv_policy="ram8k-reuse", environment=None):
+                 kv_policy="ram8k-reuse", environment=None,
+                 dspark_requested=None, dspark_disabled_reason=None):
         if family == "qwen35_moe" and (environment or os.environ).get("STRATA_QWEN35_MTP") == "1":
             raise ValueError("MiniCPM 4.7 uses DSpark; disable MTP")
         if not temp_dir.is_dir():
@@ -34,10 +36,16 @@ class NativeFamilyRunner:
         self.context = context
         self.block_size = block_size
         self.dspark = dspark
+        self.dspark_requested = dspark if dspark_requested is None else dspark_requested
+        self.dspark_disabled_reason = dspark_disabled_reason
         self.slots = slots
         self.slot_status = NativeSlots(slots)
-        self.available = queue.Queue(maxsize=slots)
         self.commands = queue.Queue()
+        self.available = queue.Queue(maxsize=slots)
+        self.progress = None
+        self.progress_ms = 0.0
+        self.prefill_tok_s_mean = None
+        self.prefill_meter = None
         for slot in range(slots):
             self.available.put(slot)
         self.temp_dir = temp_dir
@@ -81,6 +89,22 @@ class NativeFamilyRunner:
             raise RuntimeError("native engine output closed")
         return line
 
+    def _reply_line(self):
+        while True:
+            line = self._line().strip()
+            if not line.startswith("PP "):
+                return line
+            fields = line.split()
+            if len(fields) >= 3 and fields[1].isdigit() and fields[2].isdigit():
+                self.progress = (int(fields[1]), int(fields[2]))
+                self.progress_ms = float(fields[3]) if len(fields) >= 4 else 0.0
+                self.prefill_tok_s_mean = float(fields[4]) if len(fields) >= 5 else None
+                if self.prefill_meter is not None and len(fields) >= 4:
+                    try:
+                        self.prefill_meter.update(int(fields[1]), int(fields[2]), float(fields[3]))
+                    except (TypeError, ValueError):
+                        pass
+
     def close(self):
         if getattr(self, "proc", None) is not None:
             if self.proc.poll() is None:
@@ -101,7 +125,7 @@ class NativeFamilyRunner:
             try:
                 self.proc.stdin.write(line + "\n")
                 self.proc.stdin.flush()
-                reply.put(self._line().strip())
+                reply.put(self._reply_line())
             except BaseException as error:
                 reply.put(error)
 
@@ -117,7 +141,16 @@ class NativeFamilyRunner:
             raise ValueError(response[6:])
         if not response.startswith(expected + " "):
             raise RuntimeError(f"Strata DSpark target {expected}: {response or 'exited'}")
-        return dict(field.split("=", 1) for field in response.split()[1:])
+        fields = dict(field.split("=", 1) for field in response.split()[1:])
+        if expected == "PREFILL":
+            try:
+                count = int(fields["tokens"])
+                milliseconds = float(fields.get("pp_ms", fields.get("ms", 0)))
+                if count > 0 and milliseconds > 0:
+                    self.prefill_observation = dict(tokens=count, ms=milliseconds, at=time.time())
+            except (KeyError, TypeError, ValueError):
+                pass  # An optional metric must never change the model protocol.
+        return fields
 
     def _aux(self, count: int):
         import numpy as np
@@ -130,6 +163,10 @@ class NativeFamilyRunner:
     def generate(self, prompt_ids: list[int], max_new: int,
                  stops: set[int], on_token: Callable[[int], None] | None = None,
                  cancel=None, sampling=None) -> tuple[list[int], dict]:
+        self.progress = None
+        self.progress_ms = 0.0
+        self.prefill_tok_s_mean = None
+        self.prefill_meter = PrefillMeter(len(prompt_ids))
         slot = self.available.get()
         self.slot_status.begin(slot, len(prompt_ids), max_new)
         def report(token):
@@ -139,6 +176,11 @@ class NativeFamilyRunner:
         try:
             return self._generate(slot, prompt_ids, max_new, stops, report, cancel, sampling)
         finally:
+            if self.prefill_meter is not None:
+                try:
+                    self.prefill_meter.complete()
+                except (TypeError, ValueError):
+                    pass
             visual_path = getattr(prompt_ids, "visual_path", None)
             if visual_path:
                 visual_path.unlink(missing_ok=True)
@@ -157,14 +199,18 @@ class NativeFamilyRunner:
         if (len(prompt_ids) < 2 or max_new < 1 or
             len(prompt_ids) + max_new > self.context):
             raise ValueError("DSpark prompt or generation exceeds context")
-        if self.draft is not None:
-            self.draft.reset()
-        else:
-            options = dict(sampling or {})
-            options.pop("experimental_speed_projection", None)
-            options.setdefault("temperature", 0)
-            parameters = sampling_parameters(options).split(" ", 1)[1]
-            self._command(f"CONFIG {slot} {parameters}", "CONFIGURED")
+        options = dict(sampling or {})
+        options.pop("experimental_speed_projection", None)
+        options.setdefault("temperature", 0.6)
+        parameters = sampling_parameters(options).split(" ", 1)[1]
+        sampled = float(options["temperature"]) > 0 or any(
+            float(options.get(key, default)) != default for key, default in
+            (("frequency_penalty", 0), ("presence_penalty", 0), ("repetition_penalty", 1)))
+        disabled_reason = self.dspark_disabled_reason or ("request_sampling" if sampled and self.dspark else None)
+        draft = self.draft if not sampled else None
+        if draft is not None:
+            draft.reset()
+        self._command(f"CONFIG {slot} {parameters}", "CONFIGURED")
         started = time.perf_counter()
         visual_path = getattr(prompt_ids, "visual_path", None)
         try:
@@ -175,7 +221,9 @@ class NativeFamilyRunner:
                     return [], {"prompt_tokens": len(prompt_ids), "generated": 0,
                                 "pp_ms": 0, "total_ms": 0, "windows": 0,
                                 "accepted_proposals": 0, "checked_proposals": 0,
-                                "draft_ms": 0, "verify_ms": 0}
+                                "draft_ms": 0, "verify_ms": 0,
+                                "dspark_requested": self.dspark_requested, "dspark_enabled": False,
+                                "dspark_disabled_reason": disabled_reason}
                 fields = self._command(command, "PREFILL")
                 if fields is not None:
                     break
@@ -186,13 +234,15 @@ class NativeFamilyRunner:
         prompt_size = len(prompt_ids)
         if int(fields["tokens"]) != prompt_size:
             raise RuntimeError("Strata target prompt length changed")
-        if self.draft is not None:
-            self.draft.append_context(self._aux(prompt_size), 0)
+        if draft is not None:
+            draft.append_context(self._aux(prompt_size), 0)
         anchor = int(fields["anchor"])
         prefill_ms = 1000 * (time.perf_counter() - started)
         generated: list[int] = []
         emitted = 0
-        if self.draft is None:
+        if draft is None:
+            checked = accepted_proposals = windows = 0
+            native_speculative = bool(int(fields.get("speculative", 0)))
             generated.append(anchor)
             if on_token and not (cancel is not None and cancel.is_set()):
                 on_token(anchor)
@@ -203,6 +253,10 @@ class NativeFamilyRunner:
                 if self.family == "qwen35_dense":
                     command += f" {max_new - len(generated)}"
                 fields = self._command(command, "STEPPED")
+                proposed = int(fields.get("proposed", 0))
+                checked += proposed
+                accepted_proposals += int(fields.get("accepted", 0))
+                windows += int(proposed > 0)
                 picks = ([int(v) for v in fields["ids"].split(",")] if "ids" in fields
                          else [int(fields["next"])])
                 if not picks or len(picks) > max_new - len(generated):
@@ -218,8 +272,11 @@ class NativeFamilyRunner:
             elapsed_ms = 1000 * (time.perf_counter() - started)
             return generated, {"prompt_tokens": prompt_size, "generated": len(generated),
                 "pp_ms": round(prefill_ms, 3), "total_ms": round(elapsed_ms, 3),
-                "draft_ms": 0.0, "verify_ms": 0.0, "windows": 0,
-                "checked_proposals": 0, "accepted_proposals": 0}
+                "draft_ms": 0.0, "verify_ms": 0.0, "windows": windows,
+                "checked_proposals": checked, "accepted_proposals": accepted_proposals,
+                "native_speculative": native_speculative,
+                "dspark_requested": self.dspark_requested, "dspark_enabled": False,
+                "dspark_disabled_reason": disabled_reason}
         if on_token and not (cancel is not None and cancel.is_set()):
             on_token(anchor)
             emitted = 1
@@ -237,7 +294,7 @@ class NativeFamilyRunner:
                 break
             n_proposals = min(self.block_size, remaining - 1)
             t0 = time.perf_counter()
-            proposals, _ = self.draft.draft(anchor, self.draft.context_length,
+            proposals, _ = draft.draft(anchor, draft.context_length,
                                             n_proposals)
             draft_ms += 1000 * (time.perf_counter() - t0)
             t0 = time.perf_counter()
@@ -248,8 +305,8 @@ class NativeFamilyRunner:
                 len(verified_ids) > remaining or
                 int(fields["verified"]) != n_proposals + 1):
                 raise RuntimeError("Strata DSpark verification contract violated")
-            self.draft.append_context(self._aux(len(verified_ids)),
-                                      self.draft.context_length)
+            draft.append_context(self._aux(len(verified_ids)),
+                                      draft.context_length)
             verify_ms += 1000 * (time.perf_counter() - t0)
             windows += 1
             checked += n_proposals
@@ -271,6 +328,8 @@ class NativeFamilyRunner:
                  "windows": windows, "checked_proposals": checked,
                  "accepted_proposals": accepted_proposals,
                  "acceptance": round(accepted_proposals / checked, 4) if checked else 0.0,
+                 "dspark_requested": self.dspark_requested, "dspark_enabled": True,
+                 "dspark_disabled_reason": None,
                  "tg_tok_s": round(1000 * max(0, len(generated) - 1) /
                                    max(1e-6, elapsed_ms - prefill_ms), 3)}
         return generated, stats

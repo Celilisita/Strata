@@ -15,6 +15,7 @@ void Ffn::select_pp_weight_overlap(bool enabled){
     pp_weight_overlap_enabled_=enabled;
 }
 void Ffn::use_pp_gemm(DenseGemm *service){
+    if(provider_==Provider::OwnedVector){pp_gemm_=service;return;}
     if(service&&(provider_!=Provider::OwnedStaged||!buffers_.half_weights||!buffers_.half_input||
                  tiled_pair_||group_pair_||gate_.layout==BlockLayout::Q4Tiles||down_.layout==BlockLayout::Q6Codes))
         throw std::invalid_argument("Dense GEMM requires unleased staged operands");

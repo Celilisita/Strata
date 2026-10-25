@@ -1,0 +1,234 @@
+{
+  "scope": "Read-only local converter/source/receipt audit; no remote operation, compilation, inference or new model conversion performed by this documentation task.",
+  "original_input": {
+    "path": "H:\\LLM\\JonathanColetti\\Qwen3.8-27B-Uncensored-GGUF\\Qwen3.8-27B-Uncensored-Q4_K_M.gguf",
+    "bytes": 16810714528,
+    "mtime_ns": 1786812291364302100,
+    "uncensored_evidence": "Original configured folder and filename explicitly contain Qwen3.8-27B-Uncensored; name is preserved as provenance, not independently authenticated publisher identity.",
+    "publisher_status": "JonathanColetti is the recorded source folder namespace; no additional online publisher assertion is made.",
+    "GGUF_metadata": {
+      "general.architecture": "qwen35",
+      "general.name": "Abl 27b",
+      "qwen35.block_count": 65,
+      "qwen35.context_length": 262144,
+      "qwen35.embedding_length": 5120,
+      "tokenizer.ggml.model": "gpt2",
+      "tokenizer.ggml.pre": "qwen35",
+      "general.file_type": 15
+    },
+    "tensor_contract": {
+      "tensor_count": 866,
+      "tensor_table_sha256": "e396b652ea9a5b4041c5eacefd7cd99128b6fdd76488c429c68db09584334592",
+      "quant_types": {
+        "Q6_K": 67,
+        "F32": 360,
+        "Q4_K": 439
+      },
+      "data_offset": 10995104,
+      "checked": "shapes, formats, alignment and file extents; tensor payload not read",
+      "stop_ids": [
+        248046
+      ]
+    },
+    "sha256": "4c5e2db039e9325ac7724c8846c71356a24ad1cdfa28002d73ecb6be645f9675",
+    "whole_file_sha256_status": "Full source file SHA computed remotely during file-only publication; no model or GPU execution.",
+    "evidence": {
+      "path": "work/27b-perf/native-fp4/uncensored-model-files-result.json",
+      "bytes": 2482,
+      "sha256": "d60d738cd97162209e1a6e368319618434a490e3b90d35cf47b3a0116f1095f1"
+    }
+  },
+  "adopted_main": {
+    "path": "Y:\\temp\\strata-27b-perf-20261018\\native-fp4\\Qwen3.8-27B-original-derived-NVFP4.gguf",
+    "bytes": 15740217984,
+    "sha256": "0611180fd2368fa914739b4037435dad27cff76118b8036b0d770814a2079d46",
+    "converted_tensors": 400,
+    "conversion_wall_s": 31.803964499849826,
+    "fixture_cpu_sha256": "61607c8e836cf5b9535bf0ed0444315e320f2d3fa57beef08a8284555de1193e",
+    "fixture_gpu_sha256": "61607c8e836cf5b9535bf0ed0444315e320f2d3fa57beef08a8284555de1193e",
+    "fixture_byteexact": true,
+    "full_model_loads_during_conversion": 0,
+    "source_format": "Mixed original Q4_K_M GGUF: eligible large main Q4_K/Q6_K matrices converted to type40 NVFP4; remaining tensors copied byteexact.",
+    "evidence": {
+      "path": "work/27b-perf/native-fp4/gpu-conversion-runner.txt",
+      "bytes": 3362,
+      "sha256": "2430a4d1746783ab073c87e59be29becc831b6908312048e701f2ac84c9e9c49"
+    },
+    "published_path": "L:\\models\\Qwen3.8-27B-Uncensored-NVFP4-Strata\\Qwen3.8-27B-Uncensored-Q4_K_M-to-NVFP4.gguf",
+    "destination_sha256_verified": true,
+    "legacy_reference": {
+      "path": "Y:\\temp\\strata-27b-perf-20261018\\native-fp4\\Qwen3.8-27B-original-derived-NVFP4.gguf",
+      "target": "L:\\models\\Qwen3.8-27B-Uncensored-NVFP4-Strata\\Qwen3.8-27B-Uncensored-Q4_K_M-to-NVFP4.gguf",
+      "kind": "symlink",
+      "payload_duplicated": false
+    },
+    "timing_scope": "Historical main conversion only; excludes independent CPU head conversion and durable publication copy."
+  },
+  "adopted_head": {
+    "path": "Y:\\temp\\strata-27b-perf-20261018\\native-fp4\\head_fp4\\head_fp4_fixture.gguf",
+    "bytes": 715183104,
+    "sha256": "58a359c0c3b6f99ea67c31df507236c1c362867ce1c7e4ba18159cd40f7c5be0",
+    "packed_weight_sha256": "b3fb7bfff152ee5dc311701fe79450a752666190c75a19427be5630acff8fef3",
+    "source_head": {
+      "name": "output.weight",
+      "shape": [
+        5120,
+        248320
+      ],
+      "type": 14,
+      "offset": 0,
+      "bytes": 1042944000,
+      "sha256": "2155d6e1f7c5549077438c4760e6e150945dd5e406484b29162dff7b03d05da0"
+    },
+    "source_norm_sha256": "b3ba4f3231a21b1559f52115d3bffc7c28dcd03e4be22df269ef97a3f5d4bfbf",
+    "global_scale": 0.00012714238255284727,
+    "relative_l2_vs_decoded_original_Q6": 0.0862817348118232,
+    "entries": [
+      {
+        "name": "output.weight",
+        "shape": [
+          5120,
+          248320
+        ],
+        "type": 40,
+        "offset": 0,
+        "size": 715161600
+      },
+      {
+        "name": "output.scale",
+        "shape": [
+          1
+        ],
+        "type": 0,
+        "offset": 715161600,
+        "size": 4
+      },
+      {
+        "name": "output_norm.weight",
+        "shape": [
+          5120
+        ],
+        "type": 0,
+        "offset": 715161632,
+        "size": 20480
+      }
+    ],
+    "reason_separate": "Main conversion deliberately retains original output.weight Q6_K. Qualified runtime selects this separate three-tensor NVFP4 head via STRATA_NVFP4_HEAD_FILE.",
+    "evidence": {
+      "path": "work/27b-perf/native-fp4/gdn-head-conversion-receipt.json",
+      "bytes": 2064,
+      "sha256": "489f5c62344aa1cb6520907554d8a641880674d7d5f132b9f334224934b0c18e"
+    },
+    "published_path": "L:\\models\\Qwen3.8-27B-Uncensored-NVFP4-Strata\\Qwen3.8-27B-Uncensored-Head-NVFP4.gguf",
+    "destination_sha256_verified": true,
+    "legacy_reference": {
+      "path": "Y:\\temp\\strata-27b-perf-20261018\\native-fp4\\head_fp4\\head_fp4_fixture.gguf",
+      "target": "L:\\models\\Qwen3.8-27B-Uncensored-NVFP4-Strata\\Qwen3.8-27B-Uncensored-Head-NVFP4.gguf",
+      "kind": "symlink",
+      "payload_duplicated": false
+    },
+    "historical_CPU_conversion_wall_s": 188.04359020013362,
+    "timing_scope": "Historical old CPU head conversion receipt; the new parameterized tool was not executed."
+  },
+  "paired_assets_bytes": 16455401088,
+  "publication": {
+    "final_model_directory": "L:\\models\\Qwen3.8-27B-Uncensored-NVFP4-Strata",
+    "operation": "Existing complete files published at actual L paths; destination bytes/SHA verified. Historical Y paths retained as symlinks without duplicate payload. Embedded GGUF metadata and tensors unchanged.",
+    "external_rename_compatibility": "Known cold-head validation checks embedded provenance strings and tensors, not the external main/head filename. Keep the current payload/header bytes unchanged.",
+    "runtime_head_variable": "STRATA_NVFP4_HEAD_FILE points to the published paired head. Model path is supplied by caller; user router/launch entry is not modified.",
+    "file_only_result": {
+      "path": "work/27b-perf/native-fp4/uncensored-model-files-result.json",
+      "bytes": 2482,
+      "sha256": "d60d738cd97162209e1a6e368319618434a490e3b90d35cf47b3a0116f1095f1",
+      "compiled": false,
+      "GPU": false,
+      "model_loads": 0,
+      "production_unchanged": true,
+      "router_inspected": false
+    }
+  },
+  "excluded_candidates": [
+    "head-sf127 and head-sf127-abi: raw SSE improvement did not qualify native TG adoption; not the selected head.",
+    "EAGLE-4 external draft weights and negative GPU-round sources are unrelated to this converted model delivery."
+  ],
+  "algorithm": {
+    "selection": "main_layers=block_count-nextn_predict_layers; only 2-D blk.i tensors for i<main_layers, type12(Q4_K) or14(Q6_K), shape[1]>=256. Actual source65 total blocks includes1 nextN/MTP block; actual converted400 matrices.",
+    "source_math": "Decode true source Q4_K/Q6_K block payload into F32; this is lossy requantization from GGUF, not recovery of BF16 original weights.",
+    "tensor_global": "One F32 global scale per converted tensor = amax/(6*448), or1 for allzero.",
+    "block_scale": "Each16 elements: nearest positive finite E4M3 scale code0..126 around block amax/(6*global); evaluate center,center-1,center+1 in this order; choose strictly smaller actual decoded SSE, retain first on tie.",
+    "values": "E2M1 round-to-nearest-even, signedzero preserved by encoding; effective value=E2M1(code)*E4M3(block_scale)*F32(global).",
+    "file_layout": "GGUFv3 type40:64 values/36 bytes =4 E4M3 scales +32 packed E2M1 bytes; each8 low nibbles correspond to first8 values of a16block, high nibbles to final8. Separate tensorname.scale F32 scalar.",
+    "head_math": "CPU two-pass Q6_K output.weight conversion using the same rule, one global over all248320x5120 elements; source norm copied byteexact.",
+    "not_enabled": "No127-scale exhaustive search, no calibration, no new trained model, no new main/head generation in this cleanup."
+  },
+  "tools_audited": [
+    {
+      "path": "work/27b-perf/native-fp4/convert_original.py",
+      "bytes": 9184,
+      "sha256": "4fa1de34bf2f3c72bd6877ccca9af30ca103e04a34e8c6fd4f43cd5e3e2978af"
+    },
+    {
+      "path": "work/27b-perf/native-fp4/convert_gpu.cu",
+      "bytes": 7325,
+      "sha256": "d64d67f81b47a1ca9e324ef2f13d7155deca1fae1c4be0fdd35c9b1e55fca754"
+    },
+    {
+      "path": "work/27b-perf/native-fp4/gpu_conversion.py",
+      "bytes": 1939,
+      "sha256": "3130077314bb7fb4d028ae45adf5c1da7628b3d594bf510e5585959fc8796e4e"
+    },
+    {
+      "path": "work/27b-perf/native-fp4/quantize_nvfp4.py",
+      "bytes": 4182,
+      "sha256": "ff231695865b54847d5d3a6920798053bdd110b2e7e24d854f10d82057512c80"
+    },
+    {
+      "path": "work/27b-perf/native-fp4/head_fp4_convert.py",
+      "bytes": 8541,
+      "sha256": "c23cb9b45c0b2f3ea65a1d807e7392c89b623c96b9b891ce002422ea21593316"
+    },
+    {
+      "path": "work/27b-perf/native-fp4/head_fp4_gguf_reader.py",
+      "bytes": 6143,
+      "sha256": "5ecf739bb3c2f07bc7f889f7f3a455e3dfdb40068409e10781a1a9b2be289b5e"
+    },
+    {
+      "path": "work/27b-perf/native-fp4/run_conversion_batch.py",
+      "bytes": 4377,
+      "sha256": "e341141adab03087abffd5f3d090c32615d1e849f724d8a32ae937b400080791"
+    }
+  ],
+  "receipts_audited": [
+    {
+      "path": "work/27b-perf/native-fp4/conversion-manifest.json",
+      "bytes": 663,
+      "sha256": "3bb24747455b8f45c83dc99b2b5b0eed4a813dd37aea5765286d93c615304671"
+    },
+    {
+      "path": "work/27b-perf/native-fp4/conversion-reviews.json",
+      "bytes": 2119,
+      "sha256": "f761b3dc4d394fe5c94ad44f875660cc01098af1916efa79d3240a38c453a57f"
+    },
+    {
+      "path": "work/27b-perf/native-fp4/head_fp4_manifest.json",
+      "bytes": 1067,
+      "sha256": "da5708b254f5e81464c4c9733f825bf2008083aaa65f7f677d35d3f6e22d34e1"
+    },
+    {
+      "path": "work/27b-perf/native-fp4/head_fp4_provenance.json",
+      "bytes": 5011,
+      "sha256": "ea9393b8cd1345ed075e29fb4ee13fcce7ad71d3cf239cfcc1e4f7eb614f62be"
+    },
+    {
+      "path": "work/27b-perf/native-fp4/gdn-head-conversion-receipt.json",
+      "bytes": 2064,
+      "sha256": "489f5c62344aa1cb6520907554d8a641880674d7d5f132b9f334224934b0c18e"
+    },
+    {
+      "path": "work/27b-perf/native-fp4/ram40-sdpa-runtime-model-identity.json",
+      "bytes": 351,
+      "sha256": "08ae6215322e299010666322bd7c18aa910512e7377c4bcaed5c7d428694cfcc"
+    }
+  ],
+  "new_parameterized_tools_status": "New parameterized CLI statically peer-reviewed, not run on real model weights. Both main and independent head are mandatory outputs; backend selects only main CPU/GPU and head remains CPU. No automatic compile/model/inference."
+}

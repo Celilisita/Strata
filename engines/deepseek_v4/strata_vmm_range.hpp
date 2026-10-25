@@ -1,4 +1,4 @@
-// Reused from Strata include/strata/core/vmm.hpp; memory mapping only, no residency authority.
+// Private CUDA phase-cache mapping owner; distinct from public core VMM.
 #pragma once
 // CUDA virtual memory (the elastic K/V, --kv-grow): an address range reserved once, whose physical memory is mapped and
 // unmapped in chunks of the device's granularity (2 MiB).  The K/V pools grow with the context by taking chunks the
@@ -8,7 +8,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace strata::core {
+namespace strata::phase_vmm {
 
 /// A physical chunk: the driver's allocation handle (CUmemGenericAllocationHandle); 0 = none.
 using VmmChunk = unsigned long long;
@@ -41,6 +41,9 @@ public:
     template <class Take> bool map_range(int64_t lo, int64_t hi, Take take);
     /// Unmaps chunk i and hands back its physical chunk (0 when it was not mapped).
     VmmChunk unmap(int64_t i);
+    // Growth transaction only:0 success, positive driver error, -1 unsafe rollback.
+    int grow_tail_checked(int64_t target);
+    bool trim_tail_checked(int64_t keep);
 
 private:
     bool map_one(int64_t i, VmmChunk h);
@@ -48,6 +51,7 @@ private:
     /// Readable and writable [lo, hi) (all newly mapped); when that fails they are unmapped and freed again, so no
     /// chunk counts as mapped without access.
     bool commit_run(int64_t lo, int64_t hi);
+    std::vector<VmmChunk> pending_release_; // Retain any failed-release ownership.
     unsigned long long base_ = 0;
     std::vector<VmmChunk> h_;   // per chunk: its physical chunk, 0 = unmapped
 };
@@ -74,4 +78,4 @@ template <class Take> bool VmmRange::map_range(int64_t lo, int64_t hi, Take take
     return run < 0 || commit_run(run, hi);
 }
 
-}  // namespace strata::core
+}  // namespace strata::phase_vmm

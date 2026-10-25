@@ -3,8 +3,9 @@
 #include "strata/qwen35moe/prefill_observer.hpp"
 #include "strata/qwen35moe/metrics.hpp"
 #include "strata/qwen35moe/dense_profile.hpp"
-
 #include "strata/qwen35moe/spec.hpp"
+#include "strata/qwen35moe/runtime_contracts.hpp"
+#include "strata/qwen35moe/nvfp4_expert_inventory.hpp"
 #include "strata/qwen35moe/visual_input.hpp"
 #include "strata/qwen35moe/head_pick.hpp"
 #include "strata/qwen35moe/dspark_verify.hpp"
@@ -14,7 +15,10 @@
 #include "strata/kernels/radix_sampler.hpp"
 #include "strata/qwen35moe/device_buffer.hpp"
 #include "strata/qwen35moe/expert_storage.hpp"
+#include "strata/qwen35moe/expert_prefetch.hpp"
+#include "strata/qwen35moe/expert_gu_copy_pipeline.hpp"
 #include "strata/qwen35moe/batch_workspace.hpp"
+#include "strata/qwen35moe/host_readonly_lease.hpp"
 #include "strata/qwen35moe/prefill_config.hpp"
 #include <cuda_runtime.h>
 
@@ -26,123 +30,8 @@
 #include <vector>
 
 namespace strata::qwen35moe {
-
-
-struct GpuWeight {
-    DeviceBuffer data;
-    int type = -1;
-    void load(const GgufFile& gguf, const TensorInfo* tensor);
-    const void* ptr() const { return data.data(); }
-    const float* f32() const { return data.as<float>(); }
-};
-
-struct LayerWeights {
-    GpuWeight attn_norm, post_norm, router;
-    GpuWeight shared_gate, shared_up, shared_down;
-    GpuWeight qkv, gate, alpha, beta, conv, dt, a, ssm_norm, ssm_out;
-    GpuWeight q, k, v, out, q_norm, k_norm;
-    DeviceBuffer history, state, k_cache, v_cache;
-};
-
-struct Workspace {
-    DeviceBuffer hidden, norm, mixer, q8_input, q8_wide, q8_small;
-    DeviceBuffer qkv, z, alpha, beta, gate, raw, activated, core, post;
-    DeviceBuffer qfull, q, k, v, attn, gated, step, status, qpos, kpos;
-    DeviceBuffer logits, ids, weights, parts, gu_gate, gu_up, down;
-    DeviceBuffer gate_out, up_out, expert_h, shared, ffn;
-    DeviceBuffer emb_row, head_logits;
-    void allocate(int vocab, size_t embedding_row_bytes);
-};
-
-
-// Optional bounded checkpoints. The runtime never reads files or synchronizes
-// for these callbacks; the benchmark owns any sampling and comparison.
-struct CheckpointSink {
-    virtual ~CheckpointSink() = default;
-    virtual void gdn_norm_input(const float*, int, cudaStream_t) {}
-    // Optional batch-stage diagnostics; callers supply exact live byte spans.
-    virtual void batch_stage(const char*, const void*, size_t, bool, cudaStream_t) {}
-    // Normalized/rotated batch queries are ephemeral; diagnostics own any copy.
-    virtual void attention_batch_query(int, int, const float*, cudaStream_t) {}
-    // Expanded all-row GDN diagnostics use their own benchmark byte budget.
-    // Existing sampled sinks intentionally ignore these additional spans.
-    virtual void gdn_detail(const char*, const void*, size_t, bool, cudaStream_t) {}
-    virtual void layer(int position, size_t layer, const float* values,
-                       cudaStream_t stream, Metrics& metrics) = 0;
-    virtual void attention(int position, const float* q, const float* k,
-                           const float* output, cudaStream_t stream,
-                           Metrics& metrics) = 0;
-};
-
-
-struct CpuExpertState;
-struct MtpState;
-struct SamplingState;
-struct SessionSet;
-struct SessionState;
-struct VisualState;
-struct MoeGraphState;
-struct MtpCheckpointSink {
-    virtual ~MtpCheckpointSink() = default;
-    virtual void stage(int index, const float* values, size_t count, cudaStream_t stream) = 0;
-};
-struct SpeculativeStep {
-    int committed = 0, next = -1;
-    std::array<int, 2> ids{};
-    std::array<float, 2> scores{};
-};
-
-struct MtpLayerCheck {
-    std::array<double, 9> nrms{};
-    int next = -1;
-};
-
-struct PinnedExpertLayer {
-    uint8_t* data = nullptr;
-    size_t stride = 0;
-};
-
-struct PinnedExpertSet {
-    std::vector<PinnedExpertLayer> layers;
-    size_t bytes = 0;
-    std::string error;
-    PinnedExpertSet() = default;
-    PinnedExpertSet(const PinnedExpertSet&) = delete;
-    PinnedExpertSet& operator=(const PinnedExpertSet&) = delete;
-    ~PinnedExpertSet() {
-        for (auto& layer : layers)
-            if (layer.data) cudaFreeHost(layer.data);
-    }
-};
-
-struct BatchProjectionCheck {
-    double nrms = 0.0;
-    double max_abs = 0.0;
-    double native_ms = 0.0;
-    double tensor_core_ms = 0.0;
-    double grouped_nrms = 0.0;
-    double grouped_ms = 0.0;
-};
-
-struct PrefillProviderCheck {
-    std::array<double, 6> nrms{};
-    std::array<float, 2> gdn_ms{};
-    int first_route_difference = -1;
-    double state_nrms = 0, history_nrms = 0;
-};
-
-struct BatchProbe {
-    double embed = -1, norm = -1, qkv = -1, z = -1;
-    double gdn_final = -1, mixer = -1, native_mixer = -1, f32_mixer = -1;
-    double q8_gemm_mixer = -1, oracle_native_mixer = -1;
-    double oracle_f16_mixer = -1, oracle_f32_mixer = -1;
-    double oracle_q8_gemm_mixer = -1;
-    double residual = -1, post_norm = -1;
-    double logits = -1, moe_out = -1, shared = -1, layer = -1;
-    std::array<int32_t, 8> ids{};
-    std::array<float, 8> weights{};
-};
-
+struct Nvfp4ExpertState;
+class HeadReadback;
 class Runtime {
     friend struct BenchmarkProjectionOptions;
 public:
@@ -155,7 +44,13 @@ public:
     void set_checkpoint_sink(CheckpointSink* sink) { checkpoint_sink_ = sink; }
     void start_decode(Metrics* metrics = nullptr);
     void finish_decode(Metrics* metrics = nullptr);
-    void reset_session();
+    // keep_recurrent leaves GDN state and K/V for a resumed prefix.
+    void reset_session(bool keep_recurrent = false);
+    // Prompt-end recurrent snapshot: decode advances the state past the prompt,
+    // and a client that drops reasoning tokens can only resume at its end.
+    int prefill_checkpoint() const { return prefill_checkpoint_position_; }
+    void save_prefill_checkpoint(int position);
+    bool restore_prefill_checkpoint();
     void set_visual_input(VisualInput input);
     int session_capacity() const;
     size_t additional_session_bytes() const;
@@ -184,6 +79,7 @@ public:
     size_t cache_warm_experts() const { return cache_warm_experts_; }
     double cache_warm_ms() const { return cache_warm_ms_; }
     size_t pinned_expert_layers() const;
+    size_t registered_gguf_bytes() const { return host_readonly_.bytes(); }
     const std::string& pinned_expert_error() const { return pinned_experts_.error; }
     BatchProjectionCheck check_batch_projection(int count, bool shared = false);
     PrefillProviderCheck check_prefill_provider(int count, bool scan = false);
@@ -226,9 +122,10 @@ public:
     BatchProbe batch_probe() const { return batch_probe_; }
     void prepare_batch(int capacity);
     int run_prefill(const int* tokens, int count, const std::string& reference,
-                    Metrics& metrics, const PrefillObserver* observer = nullptr);
+                    Metrics& metrics, const PrefillObserver* observer = nullptr, int offset = 0);
     int run_prefill_long(const int* tokens, int count, Metrics& metrics,
-                         int chunk_capacity = 0, const PrefillObserver* observer = nullptr);
+                         int chunk_capacity = 0, const PrefillObserver* observer = nullptr,
+                         int offset = 0);
 
 private:
     void load_weights();
@@ -257,6 +154,10 @@ private:
     void check_sample_pick();
     void decode_batch_layer(size_t il, int count, int first_position,
         const std::string& reference, Metrics& metrics);
+    void batch_dense_layer(size_t il, int count, int first_position,
+        const std::string& reference);
+    std::vector<int32_t> batch_prefix_dense(size_t il, int count, int first_position,
+        const std::string& reference, Metrics& metrics);
     void decode_layer(size_t il, const LayerTensors& source, LayerWeights& layer,
                       int position, Metrics& metrics, int rope_offset = 0);
     int mtp_step(int token, int cell, const float* normalized_main, Metrics& metrics);
@@ -270,11 +171,18 @@ private:
     void invalidate_moe_graphs();
     void batch_moe_device_eager(size_t il, const LayerWeights& layer, Metrics& metrics, int count);
     void collect_dynamic_metrics(Metrics& metrics);
+    void batch_moe_nvfp4_device(size_t il,const LayerWeights& layer,Metrics& metrics);
+    void replay_nvfp4_routes(Metrics& metrics);
+    void submit_nvfp4_admission(size_t il,Metrics& metrics);
+    void wait_nvfp4_admission(size_t il);
+    void flush_nvfp4_admission(Metrics& metrics);
     void batch_moe_device(size_t il, const LayerWeights& layer, Metrics& metrics, int count = 1);
     void allocate_batch(int capacity);
     void project(const GpuWeight& weight, const void* input_q8, float* output,
                  int n_in, int n_out);
     void gdn_step(LayerWeights& layer);
+    bool gdn_dense_graph_requested() const;
+    void prepare_gdn_dense_graphs(MoeGraphState&); bool launch_gdn_dense_graph(size_t il);
     void attention_step(LayerWeights& layer, int position, int rope_offset = 0);
     void store_attention_kv(LayerWeights& layer, float* k, const float* v, int position, int rope_offset = 0, int session = -1);
     void store_attention_kv_rows(LayerWeights& layer, float* k, const float* v,
@@ -289,6 +197,7 @@ private:
     void attend_cached(LayerWeights& layer, int position);
     void batch_moe(size_t il, const LayerWeights& layer, int count,
                    const std::string& reference, Metrics& metrics);
+    void batch_moe_nvfp4(size_t il,const LayerWeights& layer,int count,const std::string& reference,Metrics& metrics);
     void batch_moe_grouped(size_t il, const LayerWeights& layer, int count,
                            const std::string& reference, Metrics& metrics);
     void batch_moe_grouped_ready(size_t il, const LayerWeights& layer, int count,
@@ -296,6 +205,7 @@ private:
                                  const std::vector<int32_t>& ids);
     uint64_t batch_moe_gu_mmq(int count, Metrics& metrics);
     uint64_t batch_moe_down_mmq(size_t il, int count, Metrics& metrics);
+    uint64_t batch_moe_down_fused(size_t il, int count, Metrics& metrics);
     void batch_moe_grouped_compute(size_t il, const LayerWeights& layer, int count,
                                    const std::string& reference, Metrics& metrics);
     void batch_moe_resident(size_t il, const LayerWeights& layer, Metrics& metrics);
@@ -314,13 +224,16 @@ private:
     void grouped_moe_token(size_t il, const LayerWeights& layer, Metrics& metrics);
     void batch_quantize_to_half(const float* input, int count, int width);
     void batch_quantize_q8(const float* input, int count, int width);
+    bool batch_project_blackwell(const GpuWeight& weight, float* output,
+                                 int count, int n_in, int n_out);
+    bool batch_project_precise_dense(const GpuWeight& weight, float* output, int count, int n_in, int n_out);
     bool batch_project_mmq(const GpuWeight& weight, float* output, int count, int n_in, int n_out, ProjectionRole role = ProjectionRole::generic);
     void batch_project_native(const GpuWeight& weight, float* output,
                               int count, int n_in, int n_out, bool allow_tensor = true);
     double batch_stage_error(const std::string& reference, const char* name,
                              const float* device, size_t width);
     int head_token(Metrics& metrics, const GpuWeight* norm = nullptr, const GpuWeight* output = nullptr);
-    struct ExpertView { const void* gate; const void* up; const void* down; };
+    struct ExpertView { const void* gate; const void* up; const void* down; float gate_scale=1,up_scale=1,down_scale=1; };
     ExpertView expert_view(size_t layer, int id, const LayerTensors& source,
                            Metrics& metrics);
     ExpertView staged_expert_view(size_t layer, int id, int entry,
@@ -330,12 +243,24 @@ private:
     void resize_expert_cache(size_t slots, Metrics& metrics);
     void prewarm_expert_cache();
     void pin_expert_weights(int count);
+    void prepare_host_readonly();
+    PpPrefetchCache prefetch_cache();
+    void prefetch_begin();
+    void prefetch_layer(size_t il,int count,const std::string& reference,Metrics& metrics);
+    void prefetch_prefix(size_t il,const std::vector<int32_t>& ids,Metrics& metrics);
+    void prefetch_routes(size_t il,const std::vector<int32_t>& ids);
+    void prefetch_finish(Metrics& metrics);
+    void prefetch_drain();
+    uint64_t prepare_gu_copy(size_t il,int count,const std::string& reference,const std::vector<int32_t>& ids,Metrics& metrics);
+    void finish_gu_copy(Metrics& metrics);
+    uint64_t prepare_expert_copy_runs(size_t il,int count,const std::string& reference,
+                                     const std::vector<int32_t>& ids,Metrics& metrics);
 
     struct ExpertCache {
         ExpertStorage data;
         DeviceBuffer resident_slots;
         size_t stride = 0, slots = 0, next = 0;
-        uint64_t tick = 0;
+        uint64_t tick = 0, epoch = 1;
         std::vector<int32_t> key_to_slot, slot_to_key;
         std::vector<uint64_t> age;
         core::ExpertRetention retention;
@@ -343,6 +268,7 @@ private:
 
     GgufFile gguf_;
     Spec spec_;
+    std::unique_ptr<Nvfp4ExpertState> nvfp4_;
     std::vector<LayerWeights> layers_;
     std::vector<LayerTensors> expert_sources_;
     std::unique_ptr<MtpState> mtp_;
@@ -363,6 +289,7 @@ private:
     DeviceBuffer head_partials_, head_pick_buffer_;
     DeviceBuffer attention_scratch_;
     HeadPick host_pick_{-1, -1, 0.0f};
+    std::unique_ptr<HeadReadback> head_readback_;
     Workspace work_;
     cudaStream_t stream_ = nullptr;
     cudaEvent_t diag_route_ready_ = nullptr;
@@ -395,6 +322,10 @@ private:
     bool tg_diag_ = false;
     int resident_layers_ = 0;
     ExpertCache expert_cache_;
+    std::unique_ptr<ExpertPrefetch> expert_prefetch_;
+    std::unique_ptr<ExpertGuCopyPipeline> gu_copy_;
+    bool gu_copy_pending_=false;size_t gu_copy_prefix_layer_=size_t(-1);
+    PpPrefetchCost gu_copy_summary_{};
     uint64_t cache_warm_bytes_ = 0;
     size_t cache_warm_experts_ = 0;
     double cache_warm_ms_ = 0;
@@ -403,10 +334,13 @@ private:
     std::unique_ptr<CpuExpertState> cpu_;
     std::vector<std::array<cudaEvent_t, 7>> prefill_events_;
     size_t prefill_event_offset_ = 0;
+    std::vector<DeviceBuffer> checkpoint_history_, checkpoint_state_;
+    int prefill_checkpoint_position_ = -1;
     DenseProfile dense_profile_;
     void prepare_prefill_events(int chunks);
     void collect_prefill_events(int chunks, Metrics& metrics);
     PinnedExpertSet pinned_experts_;
+    HostReadOnlyLease host_readonly_;
     std::unique_ptr<MoeGraphState> moe_graph_;
 };
 

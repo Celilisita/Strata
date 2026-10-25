@@ -13,6 +13,8 @@
 #include <string_view>
 #include <vector>
 
+namespace strata::glm5_next {class MtpSession;struct MtpRecursiveAccess;struct MtpVerifyAccess;struct MtpDraftProfileSnapshot;}
+
 namespace strata::deepseek_v4 {
 class MtpSidecar;class MtpDrafter;
 class ExpertPageWarm;
@@ -39,9 +41,18 @@ public:
     bool decode_image(const float* rows, size_t count, llama_pos start_pos,
                       bool logits_last, std::string& error);
     int decode_tokens(const llama_token* tokens, size_t count, llama_pos start_pos,
-                      bool logits_last, std::string& error,bool all_logits=false);
+                      bool logits_last, std::string& error,bool all_logits=false,int purpose=0);
     llama_token greedy(bool ignore_eog = false) const;
     llama_token greedy_at(int index,bool ignore_eog=false) const;
+    bool glm_mtp_enabled() const {return glm_mtp_;}
+    bool glm_verify4_probe_enabled() const {return glm_verify4_probe_;}
+    void glm_mtp_request(bool);
+    void glm_mtp_begin(const std::vector<llama_token>&);
+    llama_token glm_mtp_draft(llama_token);
+    void glm_mtp_catchup(llama_token);
+    void glm_mtp_reject(llama_pos);
+    void glm_mtp_single_advance();
+    strata::glm5_next::MtpDraftProfileSnapshot glm_mtp_draft_profile() const;
     bool mtp_enabled() const { return bool(mtp_weights_); }
     void mtp_begin(const std::vector<llama_token>& input);
     llama_token mtp_draft(llama_token next);
@@ -74,10 +85,20 @@ public:
     static bool image_api_available() noexcept;
 
 private:
+    friend struct strata::glm5_next::MtpRecursiveAccess;
+    friend struct strata::glm5_next::MtpVerifyAccess;
     explicit Runtime(const Options& options);
     bool initialize(std::string& error, ggml_backend_sched_eval_callback callback, void* data);
     bool initialize_context(std::string& error, ggml_backend_sched_eval_callback callback, void* data);
 
+    void glm_capture_hidden(size_t count,llama_pos start);
+    bool glm_mtp_=false,glm_collect_prefix_=true,glm_verify4_probe_=false;
+    std::unique_ptr<strata::glm5_next::MtpSession> glm_session_;
+    std::vector<float> glm_prefix_hidden_,glm_latest_hidden_;
+    std::array<float,4096> glm_hidden_{};
+    bool glm_catchup_pending_=false;
+    llama_token glm_catchup_token_=0;
+    std::array<float,8192> glm_catchup_hidden_{};
     Options options_;
     std::array<ggml_backend_dev_t, 2> devices_{};
     std::array<llama_model_tensor_buft_override, 2> overrides_{};

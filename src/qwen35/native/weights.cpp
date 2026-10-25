@@ -1,5 +1,6 @@
 #include "strata/qwen35/native/weights.hpp"
 #include "small_prefill_q4_tile_codes.hpp"
+#include "strata/qwen35/native/nvfp4_runtime.hpp"
 #include <algorithm>
 #include <cstdlib>
 
@@ -30,9 +31,18 @@ void DeviceStorage::release(void *p){
     bytes_-=found->second;
     check_cuda(cudaFree(p),"release idle own allocation");allocations_.erase(found);
 }
-DenseWeights::DenseWeights(const strata::GgufFile &file,const strata::qwen35::Spec &s,cudaStream_t stream,bool tiled_ffn):tiled_ffn_(tiled_ffn){
-    auto matrix=[&](const strata::TensorInfo *t,bool tile=false){
-        if(!t || t->shape.size()!=2 || (t->type!=12 && t->type!=14))
+DenseWeights::DenseWeights(const strata::GgufFile &f,const strata::qwen35::Spec &s,cudaStream_t stream,bool tiled)
+    :DenseWeights(f,s,stream,tiled,{}){}
+DenseWeights::DenseWeights(const strata::GgufFile &file,const strata::qwen35::Spec &s,cudaStream_t stream,bool tiled_ffn,ColdHeadBinding binding):tiled_ffn_(tiled_ffn){
+    if(binding.fixture)validate_cold_head_binding(file,s,binding);
+    else if(s.output&&s.output->type==40)validate_shared_head_identity(file,s);
+    auto matrix=[&](const strata::TensorInfo *t,bool tile=false,bool allow_q8=false){
+        if(t && t->type==40){
+            if(tile)throw std::invalid_argument("NVFP4 inventory cannot use a Q4 tiled policy");
+            Nvfp4View view;auto m=load_nvfp4_matrix(file,*t,storage_,view,stream);
+            fp4_weights.push_back(view);return m;
+        }
+        if(!t || t->shape.size()!=2 || (t->type!=12 && t->type!=14 && !(allow_q8 && t->type==8)))
             throw std::invalid_argument("unsupported own Dense weight format");
         Matrix m{storage_.allocate(strata::qwen35::tensor_bytes(file,*t)),Quant(t->type),int(t->shape[1]),int(t->shape[0])};
         const size_t n=matrix_bytes(m);
@@ -51,7 +61,7 @@ DenseWeights::DenseWeights(const strata::GgufFile &file,const strata::qwen35::Sp
             cudaFree(raw);
         }else{
             if(tile)throw std::invalid_argument("tiled FFN inventory requires Q4 Gate/Up");
-            check_cuda(cudaMemcpyAsync(const_cast<void *>(m.data),file.tensor_data(*t),n,cudaMemcpyHostToDevice,stream),"own setup Q6 upload");
+            check_cuda(cudaMemcpyAsync(const_cast<void *>(m.data),file.tensor_data(*t),n,cudaMemcpyHostToDevice,stream),"own setup compressed matrix upload");
         }
         return m;
     };
@@ -60,13 +70,17 @@ DenseWeights::DenseWeights(const strata::GgufFile &file,const strata::qwen35::Sp
         const size_t n=strata::qwen35::tensor_bytes(file,*t);auto *p=static_cast<float *>(storage_.allocate(n));
         check_cuda(cudaMemcpyAsync(p,file.tensor_data(*t),n,cudaMemcpyHostToDevice,stream),"own setup scalar upload");return p;
     };
-    embedding=matrix(s.embedding);head=matrix(s.output);output_norm=scalar(s.output_norm);
+    embedding=matrix(s.embedding,false,true);
+    if(binding.fixture){Nvfp4View view;head=load_cold_head_binding(file,s,binding,storage_,view,stream);fp4_weights.push_back(view);}
+    else if(s.output&&s.output->type==40){Nvfp4View view;head=load_nvfp4_shared_head(file,s,storage_,view,stream);fp4_weights.push_back(view);}
+    else head=matrix(s.output);
+    output_norm=scalar(s.output_norm);
     recurrent.resize(s.layers.size());attention.resize(s.layers.size());
     for(size_t i=0;i<s.layers.size();++i){
         const auto &l=s.layers[i];
         const Matrix gate=matrix(l.ffn_gate,tiled_ffn),up=matrix(l.ffn_up,tiled_ffn),down=matrix(l.ffn_down);
         const float *norm=scalar(l.attn_norm),*post=scalar(l.post_attn_norm);
-        if(l.recurrent)recurrent[i]={matrix(l.qkv),matrix(l.gate),matrix(l.alpha),matrix(l.beta),matrix(l.ssm_out),
+        if(l.recurrent)recurrent[i]={matrix(l.qkv),matrix(l.gate),matrix(l.alpha,false,true),matrix(l.beta,false,true),matrix(l.ssm_out),
             gate,up,down,norm,post,scalar(l.conv),scalar(l.dt),scalar(l.a),scalar(l.ssm_norm)};
         else attention[i]={matrix(l.q),matrix(l.k),matrix(l.v),matrix(l.attn_out),gate,up,down,
             norm,scalar(l.q_norm),scalar(l.k_norm),post};

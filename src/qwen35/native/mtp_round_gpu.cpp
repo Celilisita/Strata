@@ -1,6 +1,7 @@
 #include "strata/qwen35/native/mtp.hpp"
 #include "strata/qwen35/native/mtp_draft_link.hpp"
 #include "mtp_graph.hpp"
+#include "rmsconcat_policy.hpp"
 namespace strata::qwen35::native {
 std::vector<int> NativeMtp::round_gpu_chain(int known,int position,int proposals,cudaStream_t stream){
     if(graph_enabled())graphs_->begin(position,stream);
@@ -10,9 +11,9 @@ std::vector<int> NativeMtp::round_gpu_chain(int known,int position,int proposals
     const int h=int(model_.spec_.n_embd);
     for(int t=0;t<proposals;++t){
         if(graph_enabled()){
-            graphs_->draft(t,stream);counters_.D2D_bytes+=size_t(2*h)*4;
+            graphs_->draft(t,stream);counters_.D2D_bytes+=rmsconcat_copy_bytes(h,1);
         }else{
-            enqueue_draft(device_ids_+t,t?draft_seed_:seed_,position+t,stream);
+            enqueue_draft(device_ids_+t,t?draft_seed_:seed_,position+t,stream,unsigned(t));
             mtp_draft_link(picked_,invalid_,int(model_.spec_.n_vocab),device_ids_+t+1,
                            draft_ids_+t,draft_flags_+t,stream);
         }
@@ -37,9 +38,10 @@ std::vector<int> NativeMtp::round_gpu_chain(int known,int position,int proposals
         reject_prefix(accepted+1,predicted,position,stream);
     }
     const int consumed=accepted+1;
-    if(graph_enabled()){graphs_->commit(consumed,stream);counters_.D2D_bytes+=size_t(2*consumed)*h*4;}
+    if(graph_enabled()){graphs_->commit(consumed,stream);counters_.D2D_bytes+=rmsconcat_copy_bytes(h,consumed);}
     else enqueue_commit(consumed,position,stream);
     counters_.D2D_bytes+=size_t(consumed+1)*h*4;
+    ++counters_.accepted_width[accepted];
     ++counters_.rounds;counters_.proposed+=proposals;counters_.accepted+=accepted;
     return predicted;
 }

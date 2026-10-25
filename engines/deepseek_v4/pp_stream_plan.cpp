@@ -6,15 +6,15 @@
 
 namespace strata::deepseek_v4 {
 PpStreamPlan make_pp_stream_plan(const int32_t* ids, int tokens, int topk,
-                               int experts, int window_experts, size_t triplet_bytes, const int32_t* cache_slots) {
-    if (!ids || tokens < 1 || tokens > 8192 || topk < 1 || topk > 6 || experts != 256 ||
+                               int experts, int window_experts, size_t triplet_bytes, const int32_t* cache_slots, int prefix_boundary) {
+    if (!ids || tokens < 1 || tokens > 16384 || topk < 1 || topk > 8 || (experts != 256 && experts != 288) ||
         window_experts < 1 || window_experts > 64 || !triplet_bytes)
-        throw std::runtime_error("PP streaming geometry outside bounded D4 slice");
+        throw std::runtime_error("PP streaming geometry outside bounded expert slice");
     PpStreamPlan p;
     p.tokens = tokens; p.topk = topk;
     std::vector<std::vector<int32_t>> rows(experts);
     for (int t = 0; t < tokens; ++t) {
-        bool seen[256] = {};
+        bool seen[288] = {};
         for (int rank = 0; rank < topk; ++rank) {
             const int pair = t * topk + rank, expert = ids[pair];
             if (expert < 0 || expert >= experts || seen[expert])
@@ -38,7 +38,7 @@ PpStreamPlan make_pp_stream_plan(const int32_t* ids, int tokens, int topk,
             g.first_row=int(p.sorted_pairs.size());g.bounds.push_back(0);
             while(next<cached.size()&&g.experts<window_experts) {
                 const int e=cached[next];
-                if(g.experts&&(cache_slots[e]!=g.cache_first_slot+g.experts||g.rows+int(rows[e].size())>8192))break;
+                if(g.experts&&(cache_slots[e]!=g.cache_first_slot+g.experts||g.rows+int(rows[e].size())>std::max(tokens,8192)))break;
                 for(int pair:rows[e]) {p.inverse[pair]=int(p.sorted_pairs.size());p.sorted_pairs.push_back(pair);}
                 g.max_rows=std::max(g.max_rows,int(rows[e].size()));g.rows+=int(rows[e].size());
                 ++g.experts;++next;g.bounds.push_back(g.rows);
@@ -62,7 +62,7 @@ PpStreamPlan make_pp_stream_plan(const int32_t* ids, int tokens, int topk,
             // Bound activation scratch as well as expert bytes. A single
             // selected expert has at most one row per token, so this never
             // splits/reloads an expert even for highly skewed router outputs.
-            if (g.experts && g.rows + int(rows[e].size()) > 8192) break;
+            if (g.experts && (e==prefix_boundary || g.rows + int(rows[e].size()) > std::max(tokens,8192))) break;
             g.max_rows = std::max(g.max_rows, int(rows[e].size()));
             for (const auto pair : rows[e]) {
                 p.inverse[pair] = int(p.sorted_pairs.size());

@@ -11,7 +11,14 @@ struct PpStreamMetrics {
     uint64_t device_alloc_ns = 0, device_alloc_calls = 0, staging_wait_ns = 0;
     uint64_t timed_layers = 0, gpu_layer_ns = 0, gpu_weight_wait_ns = 0, gpu_products_ns = 0;
     uint64_t gpu_prelude_ns = 0, gpu_intergroup_ns = 0, gpu_tail_ns = 0;
-    uint64_t prefetch_bytes=0,prefetch_consumed_bytes=0,prefetch_launches=0;
+    uint64_t prefetch_bytes=0,prefetch_consumed_bytes=0,prefetch_launches=0,prefetch_verified_bytes=0;
+    uint64_t prefetch_enqueue_ns=0,prefetch_gpu_copy_ns=0;
+    uint64_t source_planar_groups=0,source_planar_bytes=0,source_planar_extra_GU_products=0;
+    uint64_t miss_coalesced_layers=0,miss_coalesced_groups_before=0,miss_coalesced_groups_after=0;
+    uint64_t prefix_segment_ready_banks=0,prefix_segment_ready_events=0,prefix_segment_ready_waits=0;
+    uint64_t transport_verified_groups=0,transport_verified_bytes=0,transport_verify_D2H_bytes=0;
+    bool miss_coalesce_active=false; // Latest run request; counts are successful layer submissions.
+    bool source_planar_active=false; // Latest native PP run mode; a gauge, not a delta.
 };
 PpStreamMetrics pp_stream_backend_metrics(ggml_backend_t);
 }

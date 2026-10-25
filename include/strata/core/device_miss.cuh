@@ -1,5 +1,6 @@
 #pragma once
 #include "strata/core/device_miss.hpp"
+#include "strata/prefill/native_grouped_nvfp4.hpp"
 #include <cuda/atomic>
 #include <cuda_runtime.h>
 
@@ -21,6 +22,10 @@ __device__ inline void publish_native_miss(const int32_t* ids, const NativeMissA
     if (lane == 0) {
         if (invalid) frame.failed = 1;
         frame.mask = mask;
+        if (args.ledger && args.layer==0) {
+            if(frame.token==0xffffffffu)frame.failed=5;
+            else ++frame.token;
+        }
     }
     __syncwarp();
     const unsigned hits = __ballot_sync(0xffffffffu, lane < args.ranks && slot >= 0);
@@ -39,11 +44,36 @@ __device__ inline void publish_native_miss(const int32_t* ids, const NativeMissA
         // the age; the clock still advances for every hit in rank order.
         for (int later = args.tokens > 1 ? lane + 1 : args.ranks; later < args.ranks; ++later)
             if (slot >= 0 && ids[later] == ids[lane]) last = false;
-        if (!frame.failed && slot >= 0 && last)
+        if (!args.ledger && !frame.failed && slot >= 0 && last)
             args.ages[slot] = base_tick + __popc(hits & ((1u << lane) - 1u)) + 1;
+        if(args.ledger) {
+            auto& record=args.ledger->layers[args.layer];
+            record.ids[lane]=ids[lane];
+            if(args.nv_gu) {
+                const int offset=(args.layer*args.n_expert+ids[lane])*3;
+                // Bad IDs must not index the immutable global table.
+                const float gs=bad?1.0f:args.nv_scales[offset];
+                const float us=bad?1.0f:args.nv_scales[offset+1];
+                const float ds=bad?1.0f:args.nv_scales[offset+2];
+                args.nv_gu[lane]={address,address?address+args.gu_bytes:0,gs,us,lane,lane+1,ids[lane],0};
+                args.nv_down[lane]={address?address+2*args.gu_bytes:0,0,ds,1.0f,lane,lane+1,ids[lane],0};
+                args.nv_tiles[lane]={lane,0};
+                args.nv_sources[lane]=0;args.nv_sources[args.ranks+lane]=lane;
+                args.nv_outputs[lane]=lane;
+            }
+        }
     }
     __syncwarp();
-    if (lane == 0 && !frame.failed) frame.cache_tick = base_tick + __popc(hits);
+    if (lane == 0 && !frame.failed && !args.ledger) frame.cache_tick = base_tick + __popc(hits);
+    if(args.ledger) {
+        __threadfence_system();__syncwarp();
+        if(lane==0) {
+            auto& r=args.ledger->layers[args.layer];
+            r.layer=uint32_t(args.layer);r.mask=mask;r.epoch=frame.epoch;
+            __threadfence_system();
+            cuda::atomic_ref<uint32_t,cuda::thread_scope_system>(r.token).store(frame.token,cuda::memory_order_release);
+        }
+    }
     if (frame.failed || !mask) return;
     using Atomic = cuda::atomic_ref<uint32_t, cuda::thread_scope_system>;
     if (lane == 0) {

@@ -53,6 +53,9 @@ public:
     ExpertSourcePin::Segment transport_segment(const void* source, size_t bytes) const {
         return source_pin_ ? source_pin_->segment(source, bytes) : ExpertSourcePin::Segment{bytes, false};
     }
+    uintptr_t borrow_source_alias(const void* source, size_t bytes) const {
+        return source_pin_ ? source_pin_->borrow_device_alias(source, bytes) : 0;
+    }
     void register_sources(const std::vector<ggml_tensor*>& sources, uint64_t budget,
                           std::shared_ptr<ExpertSourcePin>* retained = nullptr);
     void pack_sources(const std::vector<ggml_tensor*>&, std::shared_ptr<PackedExpertStore>* retained = nullptr);

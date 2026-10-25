@@ -1,4 +1,4 @@
-// Reused from Strata src/core/vmm.cpp.
+// Private CUDA phase-cache mapping owner.
 #include "strata_vmm_range.hpp"
 
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
@@ -7,7 +7,7 @@
 
 #include <mutex>
 
-namespace strata::core {
+namespace strata::phase_vmm {
 namespace {
 
 struct Api {
@@ -90,6 +90,7 @@ void vmm_chunk_free(VmmChunk h) {
 
 bool VmmRange::reserve(uint64_t bytes) {
     release();
+    pending_release_.reserve(1);
     const Api& a = api();
     if (!a.ok || bytes == 0) return false;
     const uint64_t n = (bytes + a.gran - 1) / a.gran;
@@ -105,6 +106,8 @@ void VmmRange::release() {
     const Api& a = api();
     for (int64_t i = 0; i < chunks(); ++i) vmm_chunk_free(unmap(i));
     a.free_va((CUdeviceptr) base_, (size_t) ((uint64_t) h_.size() * a.gran));
+    for(const auto handle:pending_release_)a.release((CUmemGenericAllocationHandle)handle);
+    pending_release_.clear();
     base_ = 0;
     h_.clear();
 }
@@ -150,11 +153,53 @@ VmmChunk VmmRange::unmap(int64_t i) {
     return h;
 }
 
-}  // namespace strata::core
+// These checked operations never modify old mappings or lend an uncertain tail.
+bool VmmRange::trim_tail_checked(int64_t keep) {
+    const auto& a=api();
+    if(!a.ok||keep<0||keep>chunks()||!pending_release_.empty())return false;
+    for(int64_t i=chunks();i-->keep;)if(mapped(i)) {
+        const auto handle=h_[size_t(i)];pending_release_.push_back(handle);
+        if(a.unmap((CUdeviceptr)(base_+uint64_t(i)*a.gran),size_t(a.gran))!=CUDA_SUCCESS) {
+            pending_release_.pop_back();return false;
+        }
+        h_[size_t(i)]=0;
+        if(a.release((CUmemGenericAllocationHandle)handle)!=CUDA_SUCCESS)return false;
+        pending_release_.pop_back();
+    }
+    return mapped_count()==keep;
+}
+int VmmRange::grow_tail_checked(int64_t target) {
+    const auto& a=api();const auto old=mapped_count();
+    if(!a.ok||target<old||target>chunks()||!pending_release_.empty())return -1;
+    for(int64_t i=0;i<chunks();++i)if(mapped(i)!=(i<old))return -1;
+    CUresult error=CUDA_SUCCESS;
+    CUmemAllocationProp prop{};prop.type=CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type=CU_MEM_LOCATION_TYPE_DEVICE;prop.location.id=a.dev;
+    for(int64_t i=old;i<target;++i) {
+        CUmemGenericAllocationHandle handle=0;
+        error=a.create(&handle,size_t(a.gran),&prop,0);
+        if(error!=CUDA_SUCCESS)break;
+        error=a.map((CUdeviceptr)(base_+uint64_t(i)*a.gran),size_t(a.gran),0,handle,0);
+        if(error!=CUDA_SUCCESS) {
+            pending_release_.push_back(VmmChunk(handle));
+            if(a.release(handle)!=CUDA_SUCCESS)return -1;
+            pending_release_.pop_back();break;
+        }
+        h_[size_t(i)]=VmmChunk(handle);
+    }
+    if(error==CUDA_SUCCESS&&target>old) {
+        CUmemAccessDesc access{};access.location=prop.location;access.flags=CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        error=a.access((CUdeviceptr)(base_+uint64_t(old)*a.gran),size_t(uint64_t(target-old)*a.gran),&access,1);
+    }
+    if(error!=CUDA_SUCCESS&&!trim_tail_checked(old))return -1;
+    return int(error);
+}
+
+}  // namespace strata::phase_vmm
 
 #else  // HIP: no virtual memory here; the elastic K/V stays off
 
-namespace strata::core {
+namespace strata::phase_vmm {
 bool vmm_available() { return false; }
 uint64_t vmm_granularity() { return 0; }
 VmmChunk vmm_chunk_new() { return 0; }
@@ -166,6 +211,8 @@ bool VmmRange::map_one(int64_t, VmmChunk) { return false; }
 bool VmmRange::set_access(int64_t, int64_t) { return false; }
 bool VmmRange::commit_run(int64_t, int64_t) { return false; }
 VmmChunk VmmRange::unmap(int64_t) { return 0; }
-}  // namespace strata::core
+int VmmRange::grow_tail_checked(int64_t) { return -1; }
+bool VmmRange::trim_tail_checked(int64_t) { return false; }
+}  // namespace strata::phase_vmm
 
 #endif

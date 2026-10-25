@@ -21,6 +21,10 @@ def tool_prefix(dialect, name=None):
 
 
 def output_parser(template, base, **kwargs):
+    if getattr(template, 'think_dialect', None) == 'gemma_channel':
+        from serve.gemma_channel_parser import GemmaChannelOutputParser
+        # the wrapper delivers the channel's inside as reasoning events; the base reads plain text
+        return GemmaChannelOutputParser(base(**{**kwargs, 'thinking': False}))
     parser = base(**kwargs)
     if getattr(template, 'tool_dialect', None) == 'deepseek_dsml' and kwargs.get('tools'):
         from serve.deepseek_tool_parser import DsmlOutputParser

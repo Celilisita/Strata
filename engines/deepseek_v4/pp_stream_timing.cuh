@@ -11,7 +11,7 @@ namespace strata::deepseek_v4 {
 // next-layer synchronization or the benchmark's phase synchronization.
 class PpStreamTiming {
     struct Group { cudaEvent_t waiting=nullptr,ready=nullptr,done=nullptr; };
-    std::array<Group,256> groups_{};
+    std::array<Group,288> groups_{};
     cudaEvent_t start_=nullptr,end_=nullptr;
     size_t count_=0;
     bool pending_=false;

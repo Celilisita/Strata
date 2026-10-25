@@ -6,8 +6,10 @@
 #include <memory>
 #include <array>
 #include <vector>
+#include <initializer_list>
 
 namespace strata::qwen35::native {
+struct Nvfp4Projection;
 struct NativeProjection32 {Matrix weight;float *output;};
 class SmallQkv32;
 class SmallQ4Projection32;
@@ -56,7 +58,9 @@ public:
     void enable_native32(cudaStream_t);
     void enable_joint_projections();
     void use_pp_gemm(DenseGemm *service,bool ffn=true,bool projections=true){
-        pp_->use_pp_gemm(ffn?service:nullptr);pp_gemm_=projections?service:nullptr;
+        pp_->use_pp_gemm(ffn?service:nullptr);
+        if(tg_)tg_->use_pp_gemm(ffn?service:nullptr);
+        pp_gemm_=projections?service:nullptr;
     }
     // Select the measured PP schedule only while the caller stream is idle.
     void use_pp_gdn_rows(int rows){
@@ -80,6 +84,7 @@ public:
         fused_pack32_=true;
     }
     void project_native32(const float *,std::initializer_list<NativeProjection32>,cudaStream_t);
+    void project_shared_nvfp4(const float *,std::initializer_list<Nvfp4Projection>,int,cudaStream_t);
     void enable_qkv32(cudaStream_t,bool complete=false,bool register_reuse=false,bool prefetch=false,bool planes=false,bool byte_planes=false);
     size_t qkv32_cache_bytes()const;
     double qkv32_cold_ms()const;
@@ -99,7 +104,7 @@ public:
         if(tokens<64){
             const bool q4=q4projection32_&&tokens==32;
             const unsigned qkv=qkv32_&&tokens==32?qkv32_extra_submissions_:(native32_&&tokens==32&&weights_.qkv.quant==Quant::Q6K?1:0);
-            return (fused_ops_&&q4?12:17)+pp_->launches(tokens)+qkv+(q4?(q4_norm_pair_?4:3):0)-(fused_pack32_&&tokens==32&&weights_.qkv.quant==Quant::Q6K?3:0);
+            return (fused_ops_&&q4?12:17)+pp_->launches(tokens)+qkv+(q4?(q4_norm_pair_?4:3):0)-(fused_pack32_&&tokens==32&&weights_.qkv.quant==Quant::Q6K?3:0)-(parameter_pair_eligible(tokens)?1:0);
         }
         unsigned count = 22 + pp_->launches(tokens);
         const Matrix matrices[]={weights_.qkv,weights_.z,weights_.alpha,weights_.beta,weights_.out};
@@ -107,6 +112,7 @@ public:
         return count;
     }
 private:
+    bool parameter_pair_eligible(int tokens)const;
     bool tiny_batches_=false;
     int pp_gdn_rows_=2;
     PpGdnKernel pp_gdn_kernel_=nullptr;

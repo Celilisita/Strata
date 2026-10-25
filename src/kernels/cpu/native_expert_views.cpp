@@ -2,9 +2,15 @@
 #include "ggml.h"
 #include "ggml-cpu.h"
 #include <cmath>
+#include "nvfp4_cpu.hpp"
 namespace strata::kernels::cpu {
 void native_gu_rows_view(const NativeFmt& f, const uint8_t* gate, const uint8_t* up,
-                         const void* const* act, int nt, float* const* ff, int r0, int r1) {
+                         const void* const* act, int nt, float* const* ff, int r0, int r1,
+                         float gate_scale, float up_scale) {
+    if (f.gu_type == 40) {
+        nvfp4_cpu_gu(f, gate, up, act, nt, ff, r0, r1, gate_scale, up_scale);
+        return;
+    }
     const ggml_vec_dot_t dot = ggml_get_type_traits_cpu(static_cast<ggml_type>(f.gu_type))->vec_dot;
     const int n = (int) f.n_embd;
     for (int r = r0; r < r1; ++r) {
@@ -19,7 +25,12 @@ void native_gu_rows_view(const NativeFmt& f, const uint8_t* gate, const uint8_t*
     }
 }
 void native_down_rows_view(const NativeFmt& f, const uint8_t* down,
-                           const void* const* hq, int nt, float* const* out, int r0, int r1) {
+                           const void* const* hq, int nt, float* const* out, int r0, int r1,
+                           float down_scale) {
+    if (f.d_type == 40) {
+        nvfp4_cpu_down(f, down, hq, nt, out, r0, r1, down_scale);
+        return;
+    }
     const ggml_vec_dot_t dot = ggml_get_type_traits_cpu(static_cast<ggml_type>(f.d_type))->vec_dot;
     const int n = (int) f.n_ff;
     for (int r = r0; r < r1; ++r) {

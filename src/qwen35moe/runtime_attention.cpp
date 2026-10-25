@@ -1,6 +1,7 @@
 #include "strata/qwen35moe/runtime.hpp"
 #include "strata/qwen35moe/cuda_kernels.hpp"
 #include "strata/qwen35moe/attention_tile.hpp"
+#include "cuda/attention_pairheads4.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/native_flash_attn.hpp"
 #include "strata/kernels/native_mmvq.hpp"
@@ -61,10 +62,11 @@ void Runtime::store_attention_kv(LayerWeights& layer, float* k, const float* v,
 void Runtime::attend_cached(LayerWeights& layer, int position) {
     auto& w = work_;
     if (tile_attention_ && position >= 256)
-        flash_attn_tile_step(w.q.as<float>(), layer.k_cache.as<uint16_t>(),
+        (void)flash_attn_tile_step_provider(w.q.as<float>(), layer.k_cache.as<uint16_t>(),
             layer.v_cache.as<uint16_t>(), w.step.as<int32_t>(), kv_capacity_, position + 1,
             w.attn.as<float>(), w.status.as<int32_t>(), nullptr,
-            attention_scratch_.as<float>(), attention_scratch_.bytes(), stream_);
+            attention_scratch_.as<float>(), attention_scratch_.bytes(), stream_,
+            decode_phase_ && !mtp_enabled_ && position + 1 >= 8192 && tg_attention_pairheads4_enabled());
     else
         flash_attn_short_step(w.q.as<float>(), layer.k_cache.as<uint16_t>(),
             layer.v_cache.as<uint16_t>(), w.step.as<int32_t>(), kv_capacity_, kv_capacity_ < 1024 ? kv_capacity_ : 1024,

@@ -13,6 +13,14 @@ void Runtime::allocate_batch(int capacity) {
     const size_t t = size_t(capacity);
     const auto f32 = [](size_t n) { return n * sizeof(float); };
     const bool large = capacity > 1024;
+    // Called smaller only at the opt-in, drained decode phase boundary.
+    // These allocations have no use below1024; prepare_batch growth recreates them.
+    if (capacity < b.capacity) {
+        b.attention_qpos.reset(); b.attention_kpos.reset();
+        b.input_low.reset(); b.weight_f32.reset(); b.weight_low.reset();
+        b.half_width = b.half_count = 0;
+        b.embedding_rows.clear();
+    }
     b.phase_arena.reset(large ? f32(t * 28672) : 0);
     auto phase = [&](DeviceBuffer& buffer, size_t elements, size_t first) {
         if (large) buffer.view(b.phase_arena, f32(t * first), f32(elements));
@@ -48,7 +56,7 @@ void Runtime::allocate_batch(int capacity) {
     b.logits.reset(f32(t * 257)); b.ids.reset(t * 8 * sizeof(int32_t));
     b.weights.reset(f32(t * 8));
     const size_t experts = t * 8;
-    if (expert_cache_.slots <= (std::min)(experts, size_t(spec_.n_expert))) {
+    if (!nvfp4_ && expert_cache_.slots <= (std::min)(experts, size_t(spec_.n_expert))) {
         const size_t gu = kernels::native_mmvq_weight_bytes(12, 2048, 512);
         const size_t down = kernels::native_mmvq_weight_bytes(14, 512, 2048);
         b.expert_stage_stride = (2 * gu + down + 255) & ~size_t(255);

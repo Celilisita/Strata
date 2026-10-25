@@ -18,6 +18,11 @@ public:
     RadixSampler& operator=(const RadixSampler&) = delete;
     void sample(const float* logits, const int* history, int history_length,
         const SamplerParams& params, void* stream, const int* failed = nullptr);
+    // Same chain with a device draw index, for captured speculative windows.
+    void sample_counter(const float* logits, const int* history, int history_length,
+        const SamplerParams& params, void* stream, const uint64_t* counter,
+        unsigned offset, const int* failed = nullptr);
+    void write_pick(int* id, unsigned* invalid, void* stream) const;
     const SamplePick* result() const;
     size_t workspace_bytes() const;
     // Bounded benchmark interface: sorted support and unnormalized final CDF.

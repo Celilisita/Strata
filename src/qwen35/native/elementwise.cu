@@ -61,13 +61,16 @@ __global__ void activate(const float *gate, const float *up, float *output, size
 }
 }
 void decode_pair(Matrix a, Matrix b, void *output, cudaStream_t stream) {
+    if((a.quant!=Quant::Q4K&&a.quant!=Quant::Q6K)||(b.quant!=Quant::Q4K&&b.quant!=Quant::Q6K))
+        throw std::invalid_argument("legacy paired decoder accepts only Q4_K/Q6_K");
     const size_t count = size_t(a.rows) * a.columns * 2;
     unpack<><<<unsigned((count / 256 + 3) / 4), 128, 0, stream>>>(a, b, static_cast<half *>(output), true);
     check_cuda(cudaGetLastError(), "native paired weight decode");
 }
 void decode_pair_interleaved(Matrix a,Matrix b,void *output,cudaStream_t stream){
     matrix_bytes(a);matrix_bytes(b);
-    if(a.rows!=b.rows||a.columns!=b.columns||!output)
+    if((a.quant!=Quant::Q4K&&a.quant!=Quant::Q6K)||(b.quant!=Quant::Q4K&&b.quant!=Quant::Q6K)||
+       a.rows!=b.rows||a.columns!=b.columns||!output)
         throw std::invalid_argument("interleaved weight geometry changed");
     const size_t count=size_t(a.rows)*a.columns*2;
     if(count/512>0x7fffffffu)throw std::invalid_argument("interleaved row/block extent exceeds32-bit index");
@@ -75,6 +78,8 @@ void decode_pair_interleaved(Matrix a,Matrix b,void *output,cudaStream_t stream)
     check_cuda(cudaGetLastError(),"Strata interleaved Gate/Up decode");
 }
 void decode_linear(Matrix a, void *output, cudaStream_t stream) {
+    if(a.quant!=Quant::Q4K&&a.quant!=Quant::Q6K)
+        throw std::invalid_argument("legacy weight decoder accepts only Q4_K/Q6_K");
     const size_t count = size_t(a.rows) * a.columns;
     unpack<><<<unsigned((count / 256 + 3) / 4), 128, 0, stream>>>(a, a, static_cast<half *>(output), false);
     check_cuda(cudaGetLastError(), "native weight decode");

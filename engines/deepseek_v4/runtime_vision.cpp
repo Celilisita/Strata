@@ -36,7 +36,7 @@ bool Runtime::decode_image(const float* rows, size_t count, llama_pos start_pos,
         llama_context* ctx;
         ~CausalRestore() { llama_set_causal_attn(ctx, true); }
     } restore{context_};
-    llama_set_causal_attn(context_, false);
+    llama_set_causal_attn(context_, metadata("general.architecture") == "glm5-next");
     prepare_device_expert_cache(context_, count);
     const int status = llama_decode(context_, batch);
     llama_batch_free(batch);

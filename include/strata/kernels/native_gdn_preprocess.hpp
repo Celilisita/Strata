@@ -37,7 +37,15 @@ void native_gdn_out_norm(const float* output, const float* z, const float* gamma
 // Batched schedules of the same canonical convolution/gate expressions.
 void native_gdn_conv_scan(float* history, const float* input, const float* weights,
                            float* output, int channels, int tokens, void* stream, float* first_token_history = nullptr);
+// Explicit independent time-window schedule; same finite-input arithmetic and
+// disjoint spans. Two launches on the caller stream, no allocation or sync.
+// No prefix snapshots; the original entry above remains the explicit control.
+void native_gdn_conv_scan_parallel(float* history, const float* input, const float* weights,
+                                  float* output, int channels, int tokens, void* stream);
 void native_gdn_gate_scan(const float* alpha, const float* dt, const float* ssm_a,
                            float* gate, int heads, int tokens, void* stream);
 
+// Same rounded log-gate expression then expf; no additional buffer or launch.
+void native_gdn_gate_scan_alpha(const float* alpha,const float* dt,const float* ssm_a,
+    float* gate,int heads,int tokens,void* stream);
 } // namespace strata::kernels
