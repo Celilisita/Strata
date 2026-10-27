@@ -14,6 +14,10 @@ if(STRATA_BUILD_DSV41 AND NOT STRATA_HIP_GFX906)
   target_include_directories(strata_dsv41_kernels PUBLIC
                              ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
   target_link_libraries(strata_dsv41_kernels PUBLIC ${_strata_gpu_runtime_target})
+  # the Titan RTX (sm_75) can carry whole layers of this model: give the vendored
+  # decode kernels a Turing binary too (exl3 dispatches to its pre-sm_80 kernels there)
+  target_compile_options(strata_dsv41_kernels PRIVATE
+                         $<$<COMPILE_LANGUAGE:CUDA>:SHELL:-gencode arch=compute_75,code=sm_75>)
 
   add_executable(strata-dsv41
                  src/dsv41/ds4_main.cpp src/dsv41/ds4_model.cu src/dsv41/ds4_kernels.cu
@@ -41,6 +45,8 @@ if(STRATA_BUILD_DSV41 AND NOT STRATA_HIP_GFX906)
                              ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml)
   target_link_libraries(strata-dsv41 PRIVATE strata_dsv41_kernels
                         ${_strata_gpu_runtime_target} ${_strata_gpu_blas_target})
+  target_compile_options(strata-dsv41 PRIVATE
+                         $<$<COMPILE_LANGUAGE:CUDA>:SHELL:-gencode arch=compute_75,code=sm_75>)
 
   find_package(Threads REQUIRED)
   target_link_libraries(strata-dsv41 PRIVATE Threads::Threads)

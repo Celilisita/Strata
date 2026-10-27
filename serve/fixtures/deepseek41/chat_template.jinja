@@ -20,7 +20,7 @@
 {%- if response_format is not defined -%}{%- set response_format = none -%}{%- endif -%}
 
 {%- if reasoning_effort is not defined or reasoning_effort is none -%}{%- set reasoning_effort = "high" -%}{%- endif -%}
-{%- set effort_map = {"low": 50, "medium": 62, "high": 75, "max": 100} -%}
+{%- set effort_map = {"low": 50, "medium": 62, "high": 75, "xhigh": 100, "max": 100} -%}
 {%- if reasoning_effort is string and reasoning_effort in effort_map -%}
     {%- set budget = effort_map[reasoning_effort] -%}
 {%- elif reasoning_effort is integer and reasoning_effort >= 1 and reasoning_effort <= 100 -%}

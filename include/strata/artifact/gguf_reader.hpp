@@ -192,6 +192,10 @@ inline bool block_geometry(uint32_t t, int& elems, int& bytes) {
         elems = 256;
         bytes = 98;
         return true;
+    case 19:   // IQ1_S: QK_K values, half + QK_K/8 + QK_K/16 = 2 + 32 + 16 = 50 bytes
+        elems = 256;
+        bytes = 50;
+        return true;
     case 20:
         elems = 32;
         bytes = 18;

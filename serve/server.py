@@ -630,6 +630,8 @@ class StrataEngine:
         self.last = {}
         self.info = {}                   # INFO key=value facts (engine 0.1.8+): kv, expert slots, ... (Monitor tab)
         self.prefill_tok_s_mean = None
+        self.prefill_tok_s = None        # this chunk's own rate (the mean above is cumulative)
+        self._pp_last = None             # (read, ms) of the previous PP line, for that rate
         self.progress = None             # (read, total) prompt tokens while a prompt is read, from PP lines
         self.progress_ms = 0             # PP's own milliseconds since the prompt started (its third field)
         self.reused = 0                  # RESUME: prompt tokens not read again (a client takes them out of the work)
@@ -1038,6 +1040,7 @@ class StrataEngine:
                     self.progress = (int(f[1]), int(f[2]))
                     self.progress_ms = float(f[3]) if len(f) >= 4 else 0.0
                     self.prefill_tok_s_mean = float(f[4]) if len(f) >= 5 else None
+                    _pp_rate(self, int(f[1]), self.progress_ms)
                 if not stopped and cancel.is_set():
                     # #879: a Stop during the prompt read went out only after the first token (or after 10 s of
                     # silence, which a stream of PP lines never allows): the engine read the whole prompt first
@@ -1192,6 +1195,7 @@ class StrataEngine:
         if not self.alive():
             raise EngineDied("the engine is unavailable; this request was not sent")
         self.progress, self.progress_ms, self.reused = None, 0, 0
+        self.prefill_tok_s, self._pp_last = None, None
         born = self.gen                                 # the engine process this request is sent to
         keys = self.sampling_keys(sampling or {})
         out: list[int] = []
@@ -1485,6 +1489,7 @@ class StrataEngine:
             yield from self.generate_batched(ids, max_new, sampling, cancel, embeddings)
             return
         self.progress, self.progress_ms, self.reused = None, 0, 0
+        self.prefill_tok_s, self._pp_last = None, None
         self.prefill_tok_s_mean = None
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
         head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
@@ -1547,6 +1552,7 @@ class StrataEngine:
                         self.progress = (int(f[1]), int(f[2]))             # prompt progress, one per chunk: also a heartbeat (the
                         self.progress_ms = float(f[3]) if len(f) >= 4 else 0.0
                         self.prefill_tok_s_mean = float(f[4]) if len(f) >= 5 else None
+                        _pp_rate(self, int(f[1]), self.progress_ms)
                         rate, chunk = self.prefill_tok_s_mean or 0.0, int(f[1]) - read_to
                         read_to = int(f[1])
                         if silence > 0 and rate > 0 and chunk > 0:   # #481: the next chunk, as long as this one
@@ -1852,6 +1858,17 @@ class Vision:
         return Path(tempfile.mkdtemp(prefix="strata-vision-"))
 
     def __init__(self, cfg: dict, log=None, env: dict | None = None, lazy: bool = False):
+        self.format = cfg.get("format", "qwen")
+        self.image_token = cfg.get("image_token")
+        self.builtin = self.format == "deepseek41"      # the engine's own tower: no separate encoder process
+        if self.builtin:
+            self.dir = self.work_dir()
+            self.spawn = ([], log, env)
+            self.proc = None
+            self.stopped = True
+            self.lock = threading.Lock()
+            self.cache: dict[str, tuple[Path, int]] = {}
+            return
         absolute = lambda p: os.path.abspath(p) if os.path.dirname(str(p)) else p   # the encoder runs in its own dir (#480)  # noqa: E731
         args = [absolute(cfg["exe"]), "--mmproj", absolute(cfg["mmproj"]), "--model", absolute(cfg["model"])]
         if cfg.get("gpu"):
@@ -1862,7 +1879,6 @@ class Vision:
             args += ["--max-tokens", str(cfg["max_tokens"])]
         if cfg.get("min_tokens"):                       # #767: mtmd's image_min_tokens (a hand-edited key)
             args += ["--min-tokens", str(cfg["min_tokens"])]
-        self.format = cfg.get("format", "qwen")
         self.dir = self.work_dir()
         self.spawn = (args, log, env)                   # to start it again after an unload
         self.proc = None
@@ -1873,6 +1889,8 @@ class Vision:
             self._start()
 
     def _start(self):
+        if self.builtin:                                # the engine's tower: there is no process to start
+            return
         args, log, env = self.spawn
         # cwd is the encoder's directory: the ENC lines name the files relative to it (#480: no space in the line)
         self.proc = popen("the image encoder", args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -2683,8 +2701,19 @@ class Service:
             eos = tokenizer.special_ids.get("tokenizer.ggml.eos_token_id")
             self.stop_ids = {int(eos)} if eos is not None else set()
         else:
-            self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
-                                tokenizer.encode("<|endoftext|>", parse_special=True))
+            # A literal the vocabulary spells as ONE token is a real stop token;
+            # one it spells as several (<|im_end|> on DeepSeek: "<", "|", "im" ...)
+            # would end every reply on an ordinary character such as "|" or ">".
+            ids = set()
+            for literal in (IM_END, "<|endoftext|>", "<｜end▁of▁sentence｜>"):
+                enc = tokenizer.encode(literal, parse_special=True)
+                if len(enc) == 1:
+                    ids.add(enc[0])
+            special = getattr(tokenizer, "special_ids", None) or {}
+            eos = special.get("eos", special.get("tokenizer.ggml.eos_token_id"))
+            if eos is not None:
+                ids.add(int(eos))
+            self.stop_ids = ids
 
     def loaded(self) -> bool:
         return not hasattr(self.engine, "alive") or self.engine.alive()
@@ -3110,6 +3139,7 @@ class Service:
                 "tok_s": round(self._tok_s(), 1) if state == "generating" else None,
                 "tok_s_mean": round(self._tok_s_mean(), 1) if state == "generating" else None,
                 "prefill_tok_s_mean": getattr(self.engine, "prefill_tok_s_mean", None) if s.get("busy") else None,
+                "prefill_tok_s": getattr(self.engine, "prefill_tok_s", None) if s.get("busy") else None,
                 "tok_s_window_s": RATE_WINDOW_S if state == "generating" else None}
         from serve.prefill_metrics import apply as apply_prefill_metrics
         apply_prefill_metrics(self, live, s)
@@ -3263,6 +3293,20 @@ class Service:
             if self.vision is None:
                 raise ValueError("this server was started without the vision encoder (run setup again and choose "
                                  "'vision'), so it cannot read images")
+            if getattr(self.vision, "format", "") == "deepseek41":
+                from serve.dsv41_visual_prompt import build_visual_prompt
+                payload = self.vision.dir / ("prompt-" + uuid.uuid4().hex + ".dsi")
+                ids = build_visual_prompt(self, messages, tools, kwargs, images, self.vision, payload,
+                                          context=self.engine.max_context)
+                room = self.engine.max_context - len(ids)
+                if room < 1:
+                    raise ValueError("the DeepSeek-V4.1 visual prompt leaves no room to answer")
+                if max_new is None or max_new <= 0:
+                    max_new = room
+                if max_new > room:
+                    max_new = room
+                self.embeddings.path = payload
+                return ids, kwargs.get("enable_thinking", True) is not False, max_new
             deepseek4v = getattr(self.vision, "format", "qwen") == "deepseek4v"
             glm5v = getattr(self.vision, "format", "qwen") == "glm5v"
             if not deepseek4v and not glm5v:
@@ -3454,6 +3498,14 @@ class Service:
             speed = ""
             meter = getattr(self.engine, "prefill_meter", None)
             current = meter.snapshot().get("current") if meter is not None else None
+            if current is None and pr and pr[1]:
+                # An engine that prints no PP line (dsv41) still reports how far it has read: two readings apart give
+                # the speed between them, which is what the live card shows.
+                prev = getattr(self, "_read_probe", None)
+                if prev and pr[0] > prev[0] and el > prev[1]:
+                    current = (pr[0] - prev[0]) / (el - prev[1])
+                    self.engine.prefill_tok_s = current
+                self._read_probe = (pr[0], el)
             if current:
                 speed = f", {current:,.0f} tok/s"
             print(f"[strata] reading the prompt: {done} tokens, {el:.0f} s so far{speed}", flush=True)
@@ -3870,8 +3922,73 @@ def request_stats(segments: list[dict]) -> dict:
     return result
 
 
+def _pp_rate(engine, read, ms):
+    """The chunk's own prompt-read rate: the mean since the prompt started is what a long read hides."""
+    prev = getattr(engine, "_pp_last", None)
+    engine._pp_last = (read, ms)
+    if prev and ms > prev[1] and read > prev[0]:
+        engine.prefill_tok_s = 1000.0 * (read - prev[0]) / (ms - prev[1])
+
+
+def _repeat_tool_guard(messages, enabled):
+    """A model that repeats one tool call with the same arguments makes no progress, and a sparse-attention
+    decoder may not see its own earlier attempts: tell it plainly instead of letting the loop run."""
+    if not enabled or not messages or messages[-1].get("role") != "tool":
+        return messages
+    sigs = []
+    i = len(messages) - 1
+    while i >= 1 and len(sigs) < 8:
+        if messages[i].get("role") != "tool" or messages[i - 1].get("role") != "assistant":
+            break
+        calls = messages[i - 1].get("tool_calls") or []
+        if not calls:
+            break
+        sigs.append(json.dumps([[c.get("function", {}).get("name"),
+                                 json.dumps(c.get("function", {}).get("arguments"), sort_keys=True)]
+                                for c in calls]))
+        i -= 2
+    counts = {}
+    for sig in sigs:
+        counts[sig] = counts.get(sig, 0) + 1
+    if not counts:
+        return messages
+    sig = max(counts, key=counts.get)
+    if counts[sig] < 3:
+        return messages
+    try:
+        name = json.loads(sig)[0][0]
+    except (ValueError, IndexError, TypeError):
+        name = "a tool"
+    out = list(messages)
+    print("[strata] repeat guard: the last %d tool calls held %d identical %s calls; a note was added"
+          % (len(sigs), counts[sig], name), flush=True)
+    out.append({"role": "user", "content": (
+        "You have already called %s %d times with identical arguments and each returned the same result, so "
+        "that step is not making progress. Do not repeat it: read the value you are missing with a different "
+        "tool or different arguments, or answer the request with what you have now." % (name, counts[sig]))})
+    return out
+
+
 def _debug_req(api, req, messages, tools, max_new, thinking, prompt_tokens):
     """One compact line per request while diagnosing blank/empty turns. Set STRATA_DEBUG=1 to enable."""
+    dump = os.environ.get("STRATA_REQ_DUMP")
+    if dump:
+        try:
+            with open(dump, "a", encoding="utf-8") as f:
+                f.write("=== %s msgs=%d tools=%d max_new=%s thinking=%s\n"
+                        % (api, len(messages), len(tools or []), max_new, thinking))
+                for i, m in enumerate(messages):
+                    body = m.get("content")
+                    if isinstance(body, list):
+                        body = " ".join(str(p.get("text", "")) for p in body if isinstance(p, dict))
+                    calls = m.get("tool_calls")
+                    f.write("  [%d] %s len=%d id=%s calls=%s\n"
+                            % (i, m.get("role"), len(str(body or "")), m.get("tool_call_id"),
+                               json.dumps(calls)[:240] if calls else "-"))
+                    if m.get("role") != "assistant":
+                        f.write("      %r\n" % (str(body or "")[:160],))
+        except Exception as exc:
+            print(f"[strata] req dump failed: {exc!r}", flush=True)
     if not os.environ.get("STRATA_DEBUG"):
         return
     last = messages[-1] if messages else {}
@@ -5023,6 +5140,7 @@ def make_handler(svc: Service):
                 tools = (tools or []) + extra or None
             if force and use_mcp:
                 raise ValueError("a forced tool_choice with MCP tools is not supported")
+            messages = _repeat_tool_guard(messages, os.environ.get("STRATA_REPEAT_GUARD") == "1")
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req)

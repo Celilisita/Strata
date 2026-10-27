@@ -13,6 +13,16 @@ MAX_CALL = 65536
 ATTR = re.compile(r'([a-z_]+)\s*=\s*([\'"])(.*?)\2', re.S)
 
 
+def normalize(buffer):
+    """The tokenizer renders the marker with a space after it, and a reply may spell the root
+    `<｜DSML｜calls>` (no `tool_`) as the model's own habit: both are the same frame here."""
+    for prefix in ('<｜DSML｜', '</｜DSML｜'):
+        buffer = buffer.replace(prefix + ' ', prefix)
+    buffer = buffer.replace('<｜DSML｜calls>', ROOT)
+    buffer = buffer.replace('</｜DSML｜calls>', ROOT_END)
+    return buffer
+
+
 def attributes(tag):
     return {m[1]: html.unescape(m[3]) for m in ATTR.finditer(tag)}
 
@@ -85,13 +95,19 @@ class DsmlOutputParser:
 
     def feed(self, text):
         from serve.frontend import Event, ToolCall
-        self.buffer += text
+        self.buffer = normalize(self.buffer + text)
         out = []
         while self.buffer:
             if not self.inside:
                 at = self.buffer.find(ROOT)
                 if at < 0:
-                    safe = len(self.buffer) - hold_suffix(self.buffer, (ROOT,))
+                    # A marker that has begun but is not complete yet waits, whatever spelling
+                    # follows it (`calls`, `tool_calls`, a space): never release it as text.
+                    started = max(self.buffer.rfind('<｜DSML｜'), self.buffer.rfind('</｜DSML｜'))
+                    if started >= 0 and '>' not in self.buffer[started:]:
+                        safe = started
+                    else:
+                        safe = len(self.buffer) - hold_suffix(self.buffer, (ROOT,))
                     if safe:
                         out += self.base.feed(self.buffer[:safe])
                         self.buffer = self.buffer[safe:]
@@ -99,6 +115,11 @@ class DsmlOutputParser:
                 if at:
                     out += self.base.feed(self.buffer[:at])
                     self.buffer = self.buffer[at:]
+                if self.base.state != 'content':
+                    # The frames may open while the parser still sits in the reasoning (a template that
+                    # rendered thinking off, or a reply that skips the marker): close it so they are read
+                    # as calls instead of being swallowed as reasoning text.
+                    out += self.base.feed('</think>')
                 if self.base.state != 'content' or not self.base._ok_at(len(self.base.buf)):
                     out += self.base.feed(self.buffer[:1])
                     self.buffer = self.buffer[1:]
@@ -107,6 +128,8 @@ class DsmlOutputParser:
                 self.inside = True
                 continue
             self.buffer = self.buffer.lstrip()
+            if self.buffer.startswith('</｜DSML｜') and '>' not in self.buffer:
+                break
             if self.buffer.startswith(ROOT_END):
                 self.buffer = self.buffer[len(ROOT_END):]
                 self.inside = False

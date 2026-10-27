@@ -82,6 +82,10 @@ def view(service, status=None):
                       prompt_total=observed['tokens'])
         return result
     mean = getattr(engine, 'prefill_tok_s_mean', None)
+    instant = getattr(engine, 'prefill_tok_s', None)
+    if positive(instant) and not status.get('first_token'):
+        # An engine that prints no PP line (dsv41) is measured from its own reading progress instead.
+        result.update(prefill_tok_s=instant, prefill_rate_source='native_reported_now')
     if positive(mean):
         result.update(prefill_tok_s_mean=mean, prefill_rate_source='native_reported_mean')
     elif status.get('first_token') and getattr(engine, 'cfg', {}).get('family') in (

@@ -139,14 +139,17 @@ EFFORT = {"none": None, "off": None, "minimal": None, "disabled": None, "false":
 def effort_kwargs(value) -> dict:
     """A reasoning effort as given by a client -> the template's kwargs.  Unknown values are a 400, not a crash."""
     if value is None or value == "":
-        return {}
+        # The DeepSeek-V4.1 template reads an absent enable_thinking as false, so a client that sends no effort
+        # (Copilot's BYOK chat, plain curl) would run the model without its reasoning and repeat its tool calls.
+        # Absent means the model's own default here: thinking on, effort high.
+        return {"enable_thinking": True}
     if value is False:
         return {"enable_thinking": False}
     key = str(value).strip().lower()
     if key not in EFFORT:
         raise ValueError(f"unknown reasoning effort {value!r}: use none, low, medium or high")
     level = EFFORT[key]
-    return {"enable_thinking": False} if level is None else {"reasoning_effort": level}
+    return {"enable_thinking": False} if level is None else {"reasoning_effort": level, "enable_thinking": True}
 
 
 def budget_effort(tokens) -> dict:

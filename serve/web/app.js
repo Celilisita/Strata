@@ -776,7 +776,7 @@ async function send() {
   setBusy(true);
 
   const body = {model: health.model, messages: apiMessages(), stream: true,
-                reasoning_effort: settings.thinking};
+                reasoning_effort: (["none", "low", "medium", "high"].includes(settings.thinking) ? settings.thinking : "high")};
   if (settings.temperature > 0) {
     Object.assign(body, {temperature: +settings.temperature, top_p: +settings.top_p, top_k: +settings.top_k});
   } else {
@@ -998,7 +998,7 @@ async function loadShared() {
   $("s-share").setAttribute("aria-checked", String(sharedOn));
 }
 function sharedDefaults(s) {
-  const d = {reasoning_effort: s.thinking, temperature: +s.temperature};
+  const d = {reasoning_effort: (["none", "low", "medium", "high"].includes(s.thinking) ? s.thinking : "high"), temperature: +s.temperature};
   if (+s.temperature > 0) Object.assign(d, {top_p: +s.top_p, top_k: +s.top_k});
   if (s.seed) d.seed = +s.seed;
   if (s.max) d.max_tokens = +s.max;
